@@ -228,10 +228,10 @@ fn test_trigger_conditional_release_panics_with_no_condition_set() {
     assert!(result.is_err());
 }
 
-/// Any authenticated caller (not just buyer/seller) may trigger the release
-/// once the condition is met.
+/// Even once the condition is met, only the buyer or arbiter may trigger the
+/// release; a third party is rejected and the escrow stays untouched.
 #[test]
-fn test_trigger_conditional_release_callable_by_third_party() {
+fn test_trigger_conditional_release_rejects_third_party() {
     let s = setup();
     let buyer = Address::generate(&s.env);
     let seller = Address::generate(&s.env);
@@ -241,12 +241,17 @@ fn test_trigger_conditional_release_callable_by_third_party() {
     inject_condition(&s, escrow_id, &s.oracle_addr, 100);
     set_price(&s, 200, 50);
 
-    // Third party triggers the release.
-    s.client.trigger_conditional_release(&third_party, &escrow_id);
+    let result = s
+        .client
+        .try_trigger_conditional_release(&third_party, &escrow_id);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        EscrowError::OnlyBuyerOrArbiterCanReleaseEscrow.into()
+    );
 
     let escrow = s.client.get_escrow(&escrow_id);
-    assert_eq!(escrow.status, EscrowStatus::Released);
-    assert_eq!(s.token_client.balance(&seller), 750);
+    assert_ne!(escrow.status, EscrowStatus::Released);
+    assert_eq!(s.token_client.balance(&seller), 0);
 }
 
 // ===========================================================================
