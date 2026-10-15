@@ -2542,7 +2542,8 @@ impl AhjoorEscrowContract {
     /// Callable by anyone; panics if the condition is not yet met.
     pub fn trigger_conditional_release(env: Env, caller: Address, escrow_id: u32) {
         Self::require_not_paused(&env);
-        caller.require_auth();
+        // caller auth is enforced by release_escrow below; requiring it here too
+        // fails with Error(Auth, ExistingValue).
 
         let condition: ConditionalRelease = env
             .storage()
