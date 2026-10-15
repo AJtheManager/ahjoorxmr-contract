@@ -236,7 +236,7 @@ pub enum ExtError {
     /// Payment is not in Authorized status for customer cancellation (#803).
     NotAuthorizedForCancel = 75,
     /// #982: token is not on the merchant's accepted token list.
-    TokenNotAcceptedByMerchant = 76,
+    TokenNotAcceptedByMerchant = 79,
     /// #981: pending payout address change has not reached its effective ledger.
     PayoutChangeNotReady = 77,
     /// #981: no pending payout address change for this merchant.
