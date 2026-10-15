@@ -24,17 +24,17 @@ fn test_add_and_remove_merchant_from_auto_approve_whitelist() {
     let merchant_a = Address::generate(&env);
     let merchant_b = Address::generate(&env);
 
-    assert_eq!(client.get_auto_approved_merchants().len(), 0);
+    assert_eq!(client.get_auto_approved_merchants(&0, &u32::MAX).len(), 0);
 
     client.add_to_auto_approve(&admin, &merchant_a);
     client.add_to_auto_approve(&admin, &merchant_b);
-    let list = client.get_auto_approved_merchants();
+    let list = client.get_auto_approved_merchants(&0, &u32::MAX);
     assert_eq!(list.len(), 2);
     assert!(list.contains(&merchant_a));
     assert!(list.contains(&merchant_b));
 
     client.remove_from_auto_approve(&admin, &merchant_a);
-    let list = client.get_auto_approved_merchants();
+    let list = client.get_auto_approved_merchants(&0, &u32::MAX);
     assert_eq!(list.len(), 1);
     assert!(!list.contains(&merchant_a));
     assert!(list.contains(&merchant_b));
