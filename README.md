@@ -7,3 +7,6 @@
 
 <!-- handsoff-issue-1049 -->
 - #1049: feat(payments): Add get_customer_payment_summary view function
+
+<!-- handsoff-issue-1054 -->
+- #1054: feat(payments): Add customer allowlist mode for merchants
