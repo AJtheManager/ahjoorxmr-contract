@@ -10,3 +10,6 @@
 
 <!-- handsoff-issue-1033 -->
 - #1033: feat(rosca): Allow changing a group's contribution token between cycles via governance
+
+<!-- handsoff-issue-1036 -->
+- #1036: feat(rosca): Add third-party contribution matching pool
