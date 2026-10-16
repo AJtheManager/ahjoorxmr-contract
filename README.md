@@ -7,3 +7,6 @@
 
 <!-- handsoff-issue-1032 -->
 - #1032: feat(rosca): Add configurable exit penalty redistributed to remaining members
+
+<!-- handsoff-issue-1033 -->
+- #1033: feat(rosca): Allow changing a group's contribution token between cycles via governance
