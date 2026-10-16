@@ -284,4 +284,29 @@ pub enum ExtError3 {
     NoVestingRecord = 155,
     /// Nothing has vested since the last claim.
     NothingVested = 156,
+    // ── Payout Holdback ───────────────────────────────────────────────────────
+    /// payout_holdback_bps must be between 0 and 5_000.
+    InvalidHoldbackBps = 157,
+    /// This setting can only be changed before the group is activated.
+    ConfigLockedAfterActivation = 158,
+    /// No holdback exists for this member and cycle.
+    NoHoldbackRecord = 159,
+    /// The holdback was already released or forfeited.
+    HoldbackSettled = 160,
+    /// The member still has contributions outstanding for the cycle.
+    HoldbackNotReleasable = 161,
+    // ── Maximum Cycle Count ───────────────────────────────────────────────────
+    /// max_cycles must be positive when set.
+    InvalidMaxCycles = 162,
+    /// The group has completed its final cycle.
+    GroupCompleted = 163,
+    // ── Member Ban List ───────────────────────────────────────────────────────
+    /// The address is banned from this group.
+    MemberBanned = 164,
+    /// An active member must be removed before they can be banned.
+    MemberStillActive = 165,
+    /// The address is already banned.
+    AlreadyBanned = 166,
+    /// The address is not banned.
+    NotBanned = 167,
 }

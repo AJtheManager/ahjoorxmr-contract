@@ -29,13 +29,19 @@ pub(crate) const MIGRATION_TIMEOUT_SECONDS: u64 = 604800; // 7 days in seconds
 // letting contributions accumulate un-paid indefinitely.
 pub(crate) const MAX_CONSECUTIVE_UNFINALIZED_ROUNDS: u32 = 3;
 
+// Upper bound on the number of entries `get_upcoming_payouts` returns.
+pub(crate) const MAX_UPCOMING_PAYOUTS: u32 = 50;
+
 pub mod types;
 pub use types::*;
 
 mod audit_trail;
+mod bans;
 mod charter;
+mod cycle_limit;
 mod errors;
 mod events;
+mod holdback;
 mod internals;
 pub mod savings_goal_tracking;
 pub mod savings_goal_tracking_impl;
@@ -770,6 +776,7 @@ impl AhjoorContract {
 
     pub fn contribute(env: Env, contributor: Address, token: Address, amount: i128) {
         internals::check_not_paused(&env);
+        cycle_limit::check_not_completed(&env);
         internals::check_not_frozen(&env);
         contributor.require_auth();
 
@@ -1095,30 +1102,6 @@ impl AhjoorContract {
                 .instance()
                 .set(&DataKey::MemberParticipation, &member_participation);
 
-            // Only trigger payout when all members have fully contributed
-            if new_total == member_required_amount && paid_members.len() == members.len() {
-                internals::complete_round_payout(&env, &paid_members);
-
-                // Emit auto-close event if enabled
-                let auto_close_enabled: bool = env
-                    .storage()
-                    .temporary()
-                    .get(&Symbol::new(&env, "auto_close_enabled"))
-                    .unwrap_or(false);
-                if auto_close_enabled {
-                    let current_round: u32 = env
-                        .storage()
-                        .instance()
-                        .get(&DataKey::CurrentRound)
-                        .unwrap_or(0);
-                    events::emit_round_auto_closed_early(
-                        &env,
-                        current_round,
-                        env.ledger().timestamp(),
-                    );
-                }
-            }
-
             // Savings Goal Progress Tracking
             let mut total_collected: i128 = env
                 .storage()
@@ -1169,6 +1152,32 @@ impl AhjoorContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::MilestonesReached, &milestones_reached);
+            }
+
+            // Only trigger payout when all members have fully contributed.
+            // Runs after the contribution is credited to `MemberCollected`
+            // so a payout that completes the group sees it.
+            if paid_members.len() == members.len() {
+                internals::complete_round_payout(&env, &paid_members);
+
+                // Emit auto-close event if enabled
+                let auto_close_enabled: bool = env
+                    .storage()
+                    .temporary()
+                    .get(&Symbol::new(&env, "auto_close_enabled"))
+                    .unwrap_or(false);
+                if auto_close_enabled {
+                    let current_round: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::CurrentRound)
+                        .unwrap_or(0);
+                    events::emit_round_auto_closed_early(
+                        &env,
+                        current_round,
+                        env.ledger().timestamp(),
+                    );
+                }
             }
         }
 
@@ -1307,6 +1316,7 @@ impl AhjoorContract {
 
     pub fn close_round(env: Env) {
         internals::check_not_paused(&env);
+        cycle_limit::check_not_completed(&env);
         internals::check_not_frozen(&env);
         let admin: Address = env
             .storage()
@@ -1389,6 +1399,8 @@ impl AhjoorContract {
         for member in defaulters.iter() {
             streak::mark_broken_current(&env, &member, "missed");
         }
+        // Holdbacks cover missed contributions first, then unvested payouts.
+        let defaulters = holdback::cover_defaults(&env, &defaulters, current_round);
         let defaulters = vesting::cover_defaults(&env, &defaulters, current_round);
         env.storage()
             .instance()
@@ -1479,6 +1491,7 @@ impl AhjoorContract {
 
     pub fn finalize_round(env: Env) {
         internals::check_not_paused(&env);
+        cycle_limit::check_not_completed(&env);
         internals::check_not_frozen(&env);
         let admin: Address = env
             .storage()
@@ -1573,6 +1586,8 @@ impl AhjoorContract {
         for member in defaulters.iter() {
             streak::mark_broken_current(&env, &member, "missed");
         }
+        // Holdbacks cover missed contributions first, then unvested payouts.
+        let defaulters = holdback::cover_defaults(&env, &defaulters, current_round);
         let defaulters = vesting::cover_defaults(&env, &defaulters, current_round);
         let paid_members: Vec<Address> =
             env.storage().instance().get(&DataKey::PaidMembers).unwrap();
@@ -3042,6 +3057,7 @@ impl AhjoorContract {
         if members.contains(&member) {
             panic_with_error!(&env, Error::AlreadyAMember);
         }
+        bans::require_not_banned(&env, &member);
 
         // Check group capacity
         let max_members: u32 = env
@@ -3135,6 +3151,8 @@ impl AhjoorContract {
         if inc.from_group != from_group {
             panic_with_error!(&env, ExtError2::MigrationNotFound);
         }
+
+        bans::require_not_banned(&env, &member);
 
         let target_slot = inc.target_slot;
         let dest_contract = env.current_contract_address();
@@ -3999,6 +4017,7 @@ impl AhjoorContract {
         if members.contains(&new_member) {
             panic_with_error!(&env, Error::AlreadyAMember);
         }
+        bans::require_not_banned(&env, &new_member);
         charter::require_charter_acknowledged(&env, &new_member);
         members.push_back(new_member.clone());
         env.storage().instance().set(&DataKey::Members, &members);
@@ -4999,6 +5018,14 @@ impl AhjoorContract {
             ProposalType::PayoutVestingUpdate => {
                 vesting::execute_vesting_update(&env, proposal_id);
             }
+            ProposalType::MemberBan => {
+                bans::ban(
+                    &env,
+                    &proposal.target_member,
+                    &BytesN::from_array(&env, &[0u8; 32]),
+                    &env.current_contract_address(),
+                );
+            }
             ProposalType::MemberFreeze => {
                 let mut reasons: Map<u32, BytesN<32>> = env
                     .storage()
@@ -5594,54 +5621,14 @@ impl AhjoorContract {
             panic_with_error!(&env, ExtError::NoFundsToDistribute);
         }
 
-        // Get member contributions for pro-rata distribution
-        let member_collected: Map<Address, i128> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MemberCollected)
-            .unwrap_or(Map::new(&env));
-
         // Mark group as dissolved
         env.storage()
             .instance()
             .set(&DataKey2::GroupStatus, &GroupStatus::Dissolved);
 
-        // Distribute funds pro-rata
-        let mut total_contributions: i128 = 0;
-        for member in members.iter() {
-            total_contributions += member_collected.get(member.clone()).unwrap_or(0);
-        }
-
-        if total_contributions > 0 {
-            for member in members.iter() {
-                let contribution = member_collected.get(member.clone()).unwrap_or(0);
-                let share = (contribution * total_pool) / total_contributions;
-                if share > 0 {
-                    client.transfer(&env.current_contract_address(), &member, &share);
-                    events::emit_member_refunded(
-                        &env,
-                        member.clone(),
-                        share,
-                        contribution,
-                        total_pool,
-                    );
-                }
-            }
-        }
-
-        // Handle rounding dust - send to fee recipient or first member
-        let remaining = client.balance(&env.current_contract_address());
-        if remaining > 0 {
-            if let Some(fee_recipient) = env
-                .storage()
-                .instance()
-                .get::<DataKey2, Address>(&DataKey2::FeeRecipient)
-            {
-                client.transfer(&env.current_contract_address(), &fee_recipient, &remaining);
-            } else if let Some(first_member) = members.get(0) {
-                client.transfer(&env.current_contract_address(), &first_member, &remaining);
-            }
-        }
+        // Distribute funds pro-rata; rounding dust goes to the fee recipient
+        // or first member.
+        internals::distribute_pro_rata(&env, &members, total_pool);
 
         let current_round: u32 = env
             .storage()
@@ -6440,40 +6427,7 @@ impl AhjoorContract {
     }
 
     pub fn get_upcoming_deadlines(env: Env, count: u32) -> Map<u32, u64> {
-        let current_round: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CurrentRound)
-            .unwrap_or(0);
-        let use_timestamp: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey2::UseTimestampSchedule)
-            .unwrap_or(false);
-
-        let current_deadline: u64 = if use_timestamp {
-            env.storage()
-                .instance()
-                .get(&DataKey::RoundDeadlineTimestamp)
-                .unwrap_or(0)
-        } else {
-            env.storage()
-                .instance()
-                .get(&DataKey::RoundDeadline)
-                .unwrap_or(0)
-        };
-
-        let round_duration: u64 = if use_timestamp {
-            env.storage()
-                .instance()
-                .get(&DataKey2::RoundDurationSeconds)
-                .unwrap_or(0)
-        } else {
-            env.storage()
-                .instance()
-                .get(&DataKey::RoundDuration)
-                .unwrap_or(0)
-        };
+        let (current_round, current_deadline, round_duration) = internals::round_schedule(&env);
 
         let mut deadlines = Map::new(&env);
         for i in 0..count {
@@ -7374,6 +7328,7 @@ impl AhjoorContract {
     /// held in `PrepaidBalance` and auto-consumed when rounds settle.
     pub fn prepay_rounds(env: Env, member: Address, num_rounds: u32) {
         internals::check_not_paused(&env);
+        cycle_limit::check_not_completed(&env);
         internals::check_not_frozen(&env);
         member.require_auth();
         charter::require_charter_acknowledged(&env, &member);
@@ -7637,6 +7592,7 @@ impl AhjoorContract {
         if members.contains(&invitee) {
             panic_with_error!(&env, Error::AlreadyAMember);
         }
+        bans::require_not_banned(&env, &invitee);
 
         let mut approved_invitees: Vec<Address> = env
             .storage()
@@ -7677,6 +7633,7 @@ impl AhjoorContract {
         if !approved_invitees.contains(&invitee) {
             panic_with_error!(&env, Error::InviteNotFound);
         }
+        bans::require_not_banned(&env, &invitee);
         charter::require_charter_acknowledged(&env, &invitee);
 
         // Remove from approved list
@@ -8467,6 +8424,7 @@ impl AhjoorContract {
         if exited_members.contains(&caller) {
             panic_with_error!(&env, Error::MemberHasExited);
         }
+        bans::require_not_banned(&env, &caller);
 
         let mut waitlist: Vec<(Address, u64)> = env
             .storage()
@@ -8672,11 +8630,18 @@ impl AhjoorContract {
     }
 
     fn try_promote_from_waitlist(env: &Env, vacated_by: &Address) {
-        let waitlist: Vec<(Address, u64)> = env
+        let stored_waitlist: Vec<(Address, u64)> = env
             .storage()
             .instance()
             .get(&DataKey2::Waitlist)
             .unwrap_or(Vec::new(&env));
+        // Banned addresses are never promoted.
+        let mut waitlist: Vec<(Address, u64)> = Vec::new(&env);
+        for entry in stored_waitlist.iter() {
+            if !bans::is_banned(env, &entry.0) {
+                waitlist.push_back(entry);
+            }
+        }
 
         if waitlist.is_empty() {
             return;
@@ -8810,6 +8775,7 @@ impl AhjoorContract {
     /// New member pays their catch-up contribution after being promoted from the waitlist.
     pub fn pay_catch_up_contribution(env: Env, member: Address) {
         internals::check_not_paused(&env);
+        cycle_limit::check_not_completed(&env);
         member.require_auth();
 
         let mut debts: Map<Address, i128> = env
@@ -9039,6 +9005,9 @@ impl AhjoorContract {
             .get(&DataKey::PayoutOrder)
             .expect("Not initialized");
 
+        for m in new_members.iter() {
+            bans::require_not_banned(&env, &m);
+        }
         for m in new_members.iter() {
             if !members.contains(&m) {
                 members.push_back(m.clone());
@@ -9318,6 +9287,7 @@ impl AhjoorContract {
         amount: i128,
     ) {
         internals::check_not_paused(&env);
+        cycle_limit::check_not_completed(&env);
         internals::check_not_frozen(&env);
         proxy.require_auth();
         charter::require_charter_acknowledged(&env, &member);
@@ -9685,6 +9655,7 @@ impl AhjoorContract {
         token: Address,
         amount: i128,
     ) {
+        cycle_limit::check_not_completed(&env);
         co_signer.require_auth();
 
         let co_signers: Map<Address, CoSignerRecord> = env
@@ -10841,6 +10812,7 @@ impl AhjoorContract {
         amount: i128,
     ) {
         internals::check_not_paused(&env);
+        cycle_limit::check_not_completed(&env);
         proxy.require_auth();
         charter::require_charter_acknowledged(&env, &member);
 
@@ -12150,6 +12122,7 @@ impl AhjoorContract {
     /// Panics with `AlreadyContributed` if the member already paid this round.
     pub fn contribute_split(env: Env, member: Address, token: Address) {
         internals::check_not_paused(&env);
+        cycle_limit::check_not_completed(&env);
         internals::check_not_frozen(&env);
         member.require_auth();
         charter::require_charter_acknowledged(&env, &member);
@@ -13066,6 +13039,160 @@ impl AhjoorContract {
             None => 0,
         }
     }
+
+    // ── Payout Holdback ───────────────────────────────────────────────────────
+
+    /// Admin sets the share of each payout withheld until the recipient has
+    /// made their remaining contributions for the cycle, in bps (0 disables,
+    /// max 5_000). Only allowed before the group is activated.
+    pub fn set_payout_holdback_bps(env: Env, admin: Address, bps: u32) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        holdback::set_holdback_bps(&env, bps);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    pub fn get_payout_holdback_bps(env: Env) -> u32 {
+        holdback::holdback_bps(&env)
+    }
+
+    /// Pay `member`'s holdback for `cycle` to their payout beneficiary (or
+    /// themselves) once every contribution they owed after their payout in
+    /// that cycle has been made. Returns the amount paid.
+    pub fn release_holdback(env: Env, _group_id: u32, member: Address, cycle: u32) -> i128 {
+        internals::check_not_paused(&env);
+        member.require_auth();
+        let amount = holdback::release(&env, &member, cycle);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        amount
+    }
+
+    pub fn get_holdback(env: Env, member: Address, cycle: u32) -> Option<HoldbackRecord> {
+        holdback::get_record(&env, &member, cycle)
+    }
+
+    // ── Maximum Cycle Count ───────────────────────────────────────────────────
+
+    /// Admin sets the number of cycles after which the group completes
+    /// (`None` = unlimited, the default). Only allowed before the group is
+    /// activated.
+    pub fn set_max_cycles(env: Env, admin: Address, max_cycles: Option<u32>) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        cycle_limit::set_max_cycles(&env, max_cycles);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    pub fn get_max_cycles(env: Env) -> Option<u32> {
+        cycle_limit::max_cycles(&env)
+    }
+
+    // ── Member Ban List ───────────────────────────────────────────────────────
+
+    /// Admin bans `member` from joining or rejoining this group by any path.
+    /// An active member must be removed first. Members can also ban an
+    /// address through a `MemberBan` governance proposal.
+    pub fn ban_member(env: Env, _group_id: u32, member: Address, reason_hash: BytesN<32>) {
+        internals::check_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+        bans::ban(&env, &member, &reason_hash, &admin);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin lifts a ban. The address must then join through the normal paths.
+    pub fn unban_member(env: Env, _group_id: u32, member: Address) {
+        internals::check_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+        bans::unban(&env, &member, &admin);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    pub fn is_banned(env: Env, _group_id: u32, member: Address) -> bool {
+        bans::is_banned(&env, &member)
+    }
+
+    // ── Upcoming Payouts ──────────────────────────────────────────────────────
+
+    /// The next `count` payouts (capped at `MAX_UPCOMING_PAYOUTS`) as
+    /// `(recipient, round, expected_at)`, where `expected_at` is the round's
+    /// contribution deadline. Recipients are chosen exactly as the payout
+    /// logic does from the current payout order, so executed slot swaps,
+    /// auction results, skips and suspensions are reflected. Empty once the
+    /// group is no longer active; stops at the final round when `max_cycles`
+    /// is set.
+    pub fn get_upcoming_payouts(env: Env, _group_id: u32, count: u32) -> Vec<(Address, u32, u64)> {
+        let mut upcoming: Vec<(Address, u32, u64)> = Vec::new(&env);
+        if Self::get_group_status(env.clone()) != GroupStatus::Active {
+            return upcoming;
+        }
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .unwrap_or(Vec::new(&env));
+        let suspended_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuspendedMembers)
+            .unwrap_or(Vec::new(&env));
+        let exited_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExitedMembers)
+            .unwrap_or(Vec::new(&env));
+        let skip_requests: Map<(Address, u32), bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SkipRequests)
+            .unwrap_or(Map::new(&env));
+
+        let (current_round, current_deadline, round_duration) = internals::round_schedule(&env);
+        // Rounds from `end_round` on are never played.
+        let end_round: Option<u32> =
+            cycle_limit::max_cycles(&env).map(|m| m.saturating_mul(payout_order.len()));
+
+        for i in 0..count.min(MAX_UPCOMING_PAYOUTS) {
+            let round = current_round + i;
+            if end_round.map_or(false, |end| round >= end) {
+                break;
+            }
+            let idx = match internals::select_payout_slot(
+                &payout_order,
+                round,
+                &suspended_members,
+                &exited_members,
+                &skip_requests,
+            ) {
+                Some(idx) => idx,
+                None => break,
+            };
+            let expected_at = current_deadline + i as u64 * round_duration;
+            upcoming.push_back((payout_order.get(idx).unwrap(), round, expected_at));
+        }
+        upcoming
+    }
 }
 
 mod test;
@@ -13098,4 +13225,8 @@ mod test_charter;
 mod test_succession;
 mod test_streak_bonus;
 mod test_payout_vesting;
+mod test_payout_holdback;
+mod test_max_cycles;
+mod test_ban_list;
+mod test_upcoming_payouts;
 pub use events::*;

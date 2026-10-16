@@ -83,6 +83,7 @@ fn require_valid_successor(env: &Env, member: &Address, successor: &Address) {
     if successor == member || members(env).contains(successor) {
         panic_with_error!(env, ExtError2::InvalidSuccessor);
     }
+    crate::bans::require_not_banned(env, successor);
 }
 
 pub(crate) fn designate(env: &Env, member: &Address, successor: &Address) {

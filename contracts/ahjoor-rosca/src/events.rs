@@ -2476,3 +2476,125 @@ pub fn emit_vesting_covered_default(
 ) {
     VestingCoveredDefault { member, round, amount, fully_covered }.publish(e);
 }
+
+// ── Payout Holdback ───────────────────────────────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutHoldbackSet {
+    pub holdback_bps: u32,
+}
+
+pub fn emit_payout_holdback_set(e: &Env, holdback_bps: u32) {
+    PayoutHoldbackSet { holdback_bps }.publish(e);
+}
+
+/// Event: Part of a round payout was withheld until the recipient makes
+/// their remaining contributions for `cycle` (through `last_round`).
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutHeldBack {
+    pub round: u32,
+    pub member: Address,
+    pub cycle: u32,
+    pub amount: i128,
+    pub last_round: u32,
+}
+
+pub fn emit_payout_held_back(
+    e: &Env,
+    round: u32,
+    member: Address,
+    cycle: u32,
+    amount: i128,
+    last_round: u32,
+) {
+    PayoutHeldBack { round, member, cycle, amount, last_round }.publish(e);
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct HoldbackReleased {
+    pub member: Address,
+    pub cycle: u32,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+pub fn emit_holdback_released(e: &Env, member: Address, cycle: u32, recipient: Address, amount: i128) {
+    HoldbackReleased { member, cycle, recipient, amount }.publish(e);
+}
+
+/// Event: A holdback was settled because the member missed a contribution
+/// for `round` (or left the group). `covered` went into the round pot and
+/// `forfeited` into the insurance pool.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct HoldbackForfeited {
+    pub member: Address,
+    pub cycle: u32,
+    pub round: u32,
+    pub covered: i128,
+    pub forfeited: i128,
+}
+
+pub fn emit_holdback_forfeited(
+    e: &Env,
+    member: Address,
+    cycle: u32,
+    round: u32,
+    covered: i128,
+    forfeited: i128,
+) {
+    HoldbackForfeited { member, cycle, round, covered, forfeited }.publish(e);
+}
+
+// ── Maximum Cycle Count ───────────────────────────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MaxCyclesSet {
+    pub max_cycles: Option<u32>,
+}
+
+pub fn emit_max_cycles_set(e: &Env, max_cycles: Option<u32>) {
+    MaxCyclesSet { max_cycles }.publish(e);
+}
+
+/// Event: The group finished its final cycle. `distributed` is the reserve
+/// and insurance balance paid back to members.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GroupCompleted {
+    pub cycles: u32,
+    pub distributed: i128,
+}
+
+pub fn emit_group_completed(e: &Env, cycles: u32, distributed: i128) {
+    GroupCompleted { cycles, distributed }.publish(e);
+}
+
+// ── Member Ban List ───────────────────────────────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MemberBanned {
+    pub member: Address,
+    pub banned_by: Address,
+    pub reason_hash: BytesN<32>,
+}
+
+pub fn emit_member_banned(e: &Env, member: Address, banned_by: Address, reason_hash: BytesN<32>) {
+    MemberBanned { member, banned_by, reason_hash }.publish(e);
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MemberUnbanned {
+    pub member: Address,
+    pub unbanned_by: Address,
+}
+
+pub fn emit_member_unbanned(e: &Env, member: Address, unbanned_by: Address) {
+    MemberUnbanned { member, unbanned_by }.publish(e);
+}

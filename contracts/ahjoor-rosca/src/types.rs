@@ -147,6 +147,7 @@ pub enum ProposalType {
     MemberFreeze = 5,  // Member-initiated emergency freeze
     CharterUpdate = 6, // Replace the group charter after activation
     PayoutVestingUpdate = 7, // Change payout_vesting_ledgers after activation
+    MemberBan = 8,           // Ban target_member from rejoining the group
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -494,6 +495,25 @@ pub enum DataKey5 {
     VestingLocked,
     /// u32 — vesting period awaiting a `PayoutVestingUpdate` proposal (persistent).
     PendingVestingLedgers(u32),
+
+    // ── Payout Holdback ───────────────────────────────────────────────────────
+    /// u32 — share of each payout withheld until the recipient's remaining
+    /// contributions for the cycle are made, in bps (0 = disabled, max 5000).
+    PayoutHoldbackBps,
+    /// HoldbackRecord — amount withheld from (member, cycle)'s payout (persistent).
+    Holdback(Address, u32),
+    /// Map<Address, u32> — member → cycle of their newest unsettled holdback.
+    HoldbackOpen,
+    /// i128 — base-token balance withheld in unsettled holdbacks.
+    HoldbackLocked,
+
+    // ── Maximum Cycle Count ───────────────────────────────────────────────────
+    /// u32 — number of cycles after which the group completes. Absent = unlimited.
+    MaxCycles,
+
+    // ── Member Ban List ───────────────────────────────────────────────────────
+    /// BytesN<32> — reason hash for a banned address (persistent). Absent = not banned.
+    Banned(Address),
 }
 
 // ── Contribution Streak Bonus ─────────────────────────────────────────────────
@@ -539,6 +559,37 @@ pub struct VestingRecord {
     pub start: u32,
     pub duration: u32,
     pub covered: i128,
+}
+
+// ── Payout Holdback ───────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HoldbackStatus {
+    /// Withheld; releasable once the member's remaining contributions are made.
+    Held = 0,
+    /// Paid out to the member (or their payout beneficiary).
+    Released = 1,
+    /// Applied to a missed contribution; the rest went to the insurance pool.
+    Forfeited = 2,
+}
+
+/// Share of a payout withheld from `member` in `cycle`. The member owes
+/// contributions for rounds `payout_round + 1 ..= last_round`; once those are
+/// made the holdback can be released.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HoldbackRecord {
+    pub member: Address,
+    pub cycle: u32,
+    pub amount: i128,
+    pub payout_round: u32,
+    pub last_round: u32,
+    /// Part of `amount` used to cover a missed contribution.
+    pub covered: i128,
+    /// Part of `amount` forfeited to the group's insurance pool.
+    pub forfeited: i128,
+    pub status: HoldbackStatus,
 }
 
 // ── Group Charter ─────────────────────────────────────────────────────────────
@@ -854,6 +905,8 @@ pub enum GroupStatus {
     Merged = 2,
     /// Group was split into two sub-groups; no further operations permitted.
     Split = 3,
+    /// Group ran its configured `max_cycles`; contributions are rejected.
+    Completed = 4,
 }
 
 #[contracttype]
