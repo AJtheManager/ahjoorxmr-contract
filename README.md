@@ -7,3 +7,6 @@
 
 <!-- handsoff-issue-1087 -->
 - #1087: test(rosca): Add test coverage for co-admin management
+
+<!-- handsoff-issue-1095 -->
+- #1095: test(escrow): Add test coverage for settlement offers, arbiter recusal and ratings
