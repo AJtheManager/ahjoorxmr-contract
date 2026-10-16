@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Map, String, Symbol, Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
@@ -147,6 +147,11 @@ pub enum ProposalType {
     MemberFreeze = 5,  // Member-initiated emergency freeze
     CharterUpdate = 6, // Replace the group charter after activation
     PayoutVestingUpdate = 7, // Change payout_vesting_ledgers after activation
+    /// Extend the current round's contribution deadline. `execution_data`
+    /// carries `extra_seconds`, bounded by `MaxRoundExtensionSeconds`.
+    ExtendRound = 8,
+    /// Waive `target_member`'s penalty for the round in `execution_data`.
+    WaivePenalty = 9,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -586,6 +591,8 @@ pub enum CoAdminPermission {
     ManageTokens = 4,
     /// Can update round configuration (duration, grace period, etc.).
     ManageRoundConfig = 5,
+    /// Can update group metadata (name, category, description hash).
+    ManageMetadata = 6,
 }
 
 /// Record stored per co-admin address.
@@ -1140,4 +1147,89 @@ pub struct GroupAnalytics {
     pub avg_credit_score: i128,
     pub avg_reputation_score: i128,
     pub fee_bps: u32,
+}
+
+/// Overflow key enum — DataKey5 is capped at 50 variants by the soroban XDR limit.
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey6 {
+    // ── Cross-Group Member Obligations ────────────────────────────────────────
+    /// Vec<Address> — other ROSCA group contracts `member` has linked to their
+    /// obligation index (persistent). This contract is always included
+    /// implicitly while the member is active here.
+    MemberGroupIndex(Address),
+
+    // ── Round Deadline Extension ──────────────────────────────────────────────
+    /// u64 — maximum `extra_seconds` an `ExtendRound` proposal may request.
+    /// 0 (default) disables member-voted extensions.
+    MaxRoundExtensionSeconds,
+    /// u32 — cycle in which the last `ExtendRound` proposal was applied.
+    LastExtendedCycle,
+
+    // ── Late-Fee Waiver ───────────────────────────────────────────────────────
+    /// CollectedPenaltyRecord — penalty collected from (member, round) (persistent).
+    CollectedPenalty(Address, u32),
+
+    // ── Group Metadata ────────────────────────────────────────────────────────
+    /// GroupMetadata — display name, category and description hash.
+    GroupMetadata,
+}
+
+// ── Cross-Group Member Obligations ────────────────────────────────────────────
+
+/// Outstanding contribution a member owes to one group for its current round.
+/// `group_id` is the group's contract address (one group per contract).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberObligation {
+    pub group_id: Address,
+    pub token: Address,
+    pub amount_due: i128,
+    pub deadline: u64,
+}
+
+// ── Late-Fee Waiver ───────────────────────────────────────────────────────────
+
+/// Penalty collected from a member for a round, kept so it can be refunded by
+/// an approved `WaivePenalty` proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectedPenaltyRecord {
+    pub member: Address,
+    pub round: u32,
+    /// Token the penalty was paid in (the group's base token).
+    pub token: Address,
+    /// Total collected for this (member, round).
+    pub amount: i128,
+    /// Net reputation change applied when the penalty was collected.
+    pub reputation_delta: i128,
+    /// Number of times the penalty was applied (each one added a default).
+    pub applications: u32,
+    pub refunded: bool,
+}
+
+// ── Group Metadata ────────────────────────────────────────────────────────────
+
+/// Human-readable group metadata, editable by the admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupMetadata {
+    pub name: String,
+    pub category: Symbol,
+    pub description_hash: BytesN<32>,
+    pub updated_at_ledger: u32,
+}
+
+/// Public directory listing for this group.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupDirectoryEntry {
+    pub group_id: Address,
+    pub metadata: Option<GroupMetadata>,
+    pub status: GroupStatus,
+    pub token: Address,
+    pub contribution_amount: i128,
+    pub member_count: u32,
+    pub max_members: u32,
+    pub current_round: u32,
 }

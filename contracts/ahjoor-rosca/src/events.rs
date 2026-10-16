@@ -2476,3 +2476,112 @@ pub fn emit_vesting_covered_default(
 ) {
     VestingCoveredDefault { member, round, amount, fully_covered }.publish(e);
 }
+
+// ── Cross-Group Member Obligations ────────────────────────────────────────────
+
+/// Event: A member linked another group contract to their obligation index.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MemberGroupLinked {
+    pub member: Address,
+    pub group: Address,
+}
+
+pub fn emit_member_group_linked(e: &Env, member: Address, group: Address) {
+    MemberGroupLinked { member, group }.publish(e);
+}
+
+/// Event: A member removed a group contract from their obligation index.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MemberGroupUnlinked {
+    pub member: Address,
+    pub group: Address,
+}
+
+pub fn emit_member_group_unlinked(e: &Env, member: Address, group: Address) {
+    MemberGroupUnlinked { member, group }.publish(e);
+}
+
+// ── Round Deadline Extension ──────────────────────────────────────────────────
+
+/// Event: Admin set the maximum member-voted round extension.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MaxRoundExtensionSet {
+    pub admin: Address,
+    pub max_extra_seconds: u64,
+}
+
+pub fn emit_max_round_extension_set(e: &Env, admin: Address, max_extra_seconds: u64) {
+    MaxRoundExtensionSet { admin, max_extra_seconds }.publish(e);
+}
+
+/// Event: An approved `ExtendRound` proposal moved the current round deadline.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RoundDeadlineExtended {
+    pub proposal_id: u32,
+    pub round: u32,
+    pub cycle: u32,
+    pub extra_seconds: u64,
+    pub new_deadline: u64,
+}
+
+pub fn emit_round_deadline_extended(
+    e: &Env,
+    proposal_id: u32,
+    round: u32,
+    cycle: u32,
+    extra_seconds: u64,
+    new_deadline: u64,
+) {
+    RoundDeadlineExtended { proposal_id, round, cycle, extra_seconds, new_deadline }.publish(e);
+}
+
+// ── Late-Fee Waiver ───────────────────────────────────────────────────────────
+
+/// Event: An approved `WaivePenalty` proposal cleared or refunded a penalty.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PenaltyWaived {
+    pub proposal_id: u32,
+    pub member: Address,
+    pub round: u32,
+    /// `true` when the penalty had already been collected and was refunded.
+    pub was_collected: bool,
+    pub refunded_amount: i128,
+}
+
+pub fn emit_penalty_waived(
+    e: &Env,
+    proposal_id: u32,
+    member: Address,
+    round: u32,
+    was_collected: bool,
+    refunded_amount: i128,
+) {
+    PenaltyWaived { proposal_id, member, round, was_collected, refunded_amount }.publish(e);
+}
+
+// ── Group Metadata ────────────────────────────────────────────────────────────
+
+/// Event: Group metadata was set or changed.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GroupMetadataUpdated {
+    pub updated_by: Address,
+    pub name: soroban_sdk::String,
+    pub category: Symbol,
+    pub description_hash: BytesN<32>,
+}
+
+pub fn emit_group_metadata_updated(
+    e: &Env,
+    updated_by: Address,
+    name: soroban_sdk::String,
+    category: Symbol,
+    description_hash: BytesN<32>,
+) {
+    GroupMetadataUpdated { updated_by, name, category, description_hash }.publish(e);
+}
