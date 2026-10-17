@@ -37,6 +37,10 @@ mod charter;
 mod errors;
 mod events;
 mod internals;
+mod metadata;
+mod obligations;
+mod penalty_waiver;
+mod round_extension;
 pub mod savings_goal_tracking;
 pub mod savings_goal_tracking_impl;
 mod streak;
@@ -55,6 +59,7 @@ mod clone_client;
 pub use clone_client::RoscaCloneClient;
 mod migration_client;
 pub use migration_client::RoscaMigrationClient;
+pub use obligations::RoscaObligationClient;
 
 use crate::errors::{Error, ExtError, ExtError2};
 
@@ -3833,7 +3838,9 @@ impl AhjoorContract {
         let mut still_pending: Map<Address, u32> = Map::new(env);
         for (member, pending_round) in pending_penalties.iter() {
             if current_ledger > grace_expires_at || current_round > pending_round {
-                Self::apply_penalty(env, member, penalty_amount, current_round);
+                // Charged against the round it was queued for, so a
+                // `WaivePenalty` proposal can find it under the same round.
+                Self::apply_penalty(env, member, penalty_amount, pending_round);
             } else {
                 still_pending.set(member, pending_round);
             }
@@ -3850,6 +3857,7 @@ impl AhjoorContract {
 
         member.require_auth();
         client.transfer(&member, &env.current_contract_address(), &penalty_amount);
+        let reputation_before = Self::get_reputation_score(env.clone(), member.clone());
 
         let mut default_count: Map<Address, u32> = env
             .storage()
@@ -3874,6 +3882,15 @@ impl AhjoorContract {
         Self::apply_reputation_delta(env, member.clone(), -20, "defaulted");
         // Late-but-paid: member settled after defaulting.
         Self::apply_reputation_delta(env, member.clone(), 5, "late_paid");
+        let reputation_after = Self::get_reputation_score(env.clone(), member.clone());
+        penalty_waiver::record_collected(
+            env,
+            &member,
+            round,
+            &token_addr,
+            penalty_amount,
+            reputation_after - reputation_before,
+        );
 
         let max_defaults: u32 = env
             .storage()
@@ -4473,7 +4490,30 @@ impl AhjoorContract {
     ) {
         internals::check_not_paused(&env);
         creator.require_auth();
+        Self::create_proposal_internal(
+            &env,
+            creator,
+            proposal_type,
+            description,
+            target_member,
+            voting_duration,
+            execution_data,
+        );
+    }
 
+    /// Shared body of `create_proposal` and the typed proposal helpers
+    /// (`propose_round_extension`, `propose_penalty_waiver`). The caller is
+    /// responsible for `creator.require_auth()`. Returns the proposal id.
+    fn create_proposal_internal(
+        env: &Env,
+        creator: Address,
+        proposal_type: ProposalType,
+        description: soroban_sdk::String,
+        target_member: Address,
+        voting_duration: u64,
+        execution_data: Option<i128>,
+    ) -> u32 {
+        let env = env.clone();
         let members: Vec<Address> = env
             .storage()
             .instance()
@@ -4481,6 +4521,17 @@ impl AhjoorContract {
             .expect("Not initialized");
         if !members.contains(&creator) {
             panic_with_error!(&env, Error::OnlyMembersAllowed);
+        }
+
+        // Reject typed proposals that could never execute.
+        match proposal_type {
+            ProposalType::ExtendRound => {
+                round_extension::validate(&env, execution_data);
+            }
+            ProposalType::WaivePenalty => {
+                penalty_waiver::require_penalty_exists(&env, &target_member, execution_data);
+            }
+            _ => {}
         }
 
         let current_time = env.ledger().timestamp();
@@ -4562,6 +4613,7 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        proposal_id
     }
 
     pub fn get_member_voting_weight(env: Env, member: Address) -> i128 {
@@ -5007,6 +5059,17 @@ impl AhjoorContract {
             }
             ProposalType::PayoutVestingUpdate => {
                 vesting::execute_vesting_update(&env, proposal_id);
+            }
+            ProposalType::ExtendRound => {
+                round_extension::execute(&env, proposal_id, proposal.execution_data);
+            }
+            ProposalType::WaivePenalty => {
+                penalty_waiver::execute(
+                    &env,
+                    proposal_id,
+                    &proposal.target_member,
+                    proposal.execution_data,
+                );
             }
             ProposalType::MemberFreeze => {
                 let mut reasons: Map<u32, BytesN<32>> = env
@@ -13080,6 +13143,170 @@ impl AhjoorContract {
             Some(record) => vesting::claimable_amount(&env, &record),
             None => 0,
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Cross-Group Member Obligations ────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Member: add another ROSCA group contract to `member`'s obligation
+    /// index on this contract. The member must be active in `group`.
+    pub fn link_member_group(env: Env, member: Address, group: Address) {
+        member.require_auth();
+        obligations::link_group(&env, &member, &group);
+    }
+
+    /// Member: remove `group` from `member`'s obligation index.
+    pub fn unlink_member_group(env: Env, member: Address, group: Address) {
+        member.require_auth();
+        obligations::unlink_group(&env, &member, &group);
+    }
+
+    /// View: the other group contracts linked to `member`'s index.
+    pub fn get_member_group_index(env: Env, member: Address) -> Vec<Address> {
+        obligations::linked_groups(&env, &member)
+    }
+
+    /// View: `true` when `member` is an active (not exited or suspended)
+    /// member of this group and the group itself is active.
+    pub fn is_active_group_member(env: Env, member: Address) -> bool {
+        obligations::is_active_member(&env, &member)
+    }
+
+    /// View: what `member` still owes this group for the current round.
+    /// `None` when nothing is due or the member / group is no longer active.
+    pub fn get_group_obligation(env: Env, member: Address) -> Option<MemberObligation> {
+        obligations::local_obligation(&env, &member)
+    }
+
+    /// View: `member`'s outstanding contributions across this group and every
+    /// group in their index, as `(group_id, token, amount_due, deadline)`.
+    /// Exited, completed (dissolved / merged / split) and fully paid groups
+    /// are excluded.
+    pub fn get_member_obligations(env: Env, member: Address) -> Vec<MemberObligation> {
+        obligations::member_obligations(&env, &member)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Member-Voted Round Extension ──────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Admin (or co-admin with `ManageRoundConfig`): set the maximum number of
+    /// seconds an `ExtendRound` proposal may add to a round deadline.
+    /// 0 (default) disables member-voted extensions.
+    pub fn set_max_round_extension(env: Env, admin: Address, max_extra_seconds: u64) {
+        admin.require_auth();
+        internals::check_not_paused(&env);
+        if !Self::is_admin_or_co_admin(&env, &admin, CoAdminPermission::ManageRoundConfig) {
+            Self::require_co_admin_permission(&env, &admin, CoAdminPermission::ManageRoundConfig);
+        }
+        round_extension::set_max_extension(&env, max_extra_seconds);
+        events::emit_max_round_extension_set(&env, admin, max_extra_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// View: maximum `extra_seconds` allowed per extension (0 = disabled).
+    pub fn get_max_round_extension(env: Env) -> u64 {
+        round_extension::max_extension(&env)
+    }
+
+    /// View: cycle in which the last round extension was applied, if any.
+    pub fn get_last_extended_cycle(env: Env) -> Option<u32> {
+        round_extension::last_extended_cycle(&env)
+    }
+
+    /// Member: open an `ExtendRound` proposal adding `extra_seconds` to the
+    /// current round deadline. Returns the proposal id. Voting must close
+    /// before the current deadline for the proposal to be executable.
+    pub fn propose_round_extension(
+        env: Env,
+        proposer: Address,
+        extra_seconds: u64,
+        voting_duration: u64,
+    ) -> u32 {
+        internals::check_not_paused(&env);
+        proposer.require_auth();
+        Self::create_proposal_internal(
+            &env,
+            proposer.clone(),
+            ProposalType::ExtendRound,
+            String::from_str(&env, "Extend round deadline"),
+            proposer,
+            voting_duration,
+            Some(extra_seconds as i128),
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Late-Fee Waiver ───────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Member: open a `WaivePenalty` proposal for `member`'s penalty in
+    /// `round` (the round reported by `get_pending_penalties` or
+    /// `get_collected_penalty`). Returns the proposal id.
+    pub fn propose_penalty_waiver(
+        env: Env,
+        proposer: Address,
+        member: Address,
+        round: u32,
+        voting_duration: u64,
+    ) -> u32 {
+        internals::check_not_paused(&env);
+        proposer.require_auth();
+        Self::create_proposal_internal(
+            &env,
+            proposer,
+            ProposalType::WaivePenalty,
+            String::from_str(&env, "Waive late penalty"),
+            member,
+            voting_duration,
+            Some(round as i128),
+        )
+    }
+
+    /// View: penalty collected from `member` for `round`, if any.
+    pub fn get_collected_penalty(env: Env, member: Address, round: u32) -> Option<CollectedPenaltyRecord> {
+        penalty_waiver::get_collected(&env, &member, round)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Group Metadata ────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Admin (or co-admin with `ManageMetadata`): set the group's display
+    /// name (1..=64 bytes), category and description hash.
+    ///
+    /// `group_id` is accepted for API consistency with other group-scoped
+    /// functions; this contract manages a single group per instance.
+    pub fn set_group_metadata(
+        env: Env,
+        caller: Address,
+        _group_id: u32,
+        name: String,
+        category: Symbol,
+        description_hash: BytesN<32>,
+    ) {
+        caller.require_auth();
+        internals::check_not_paused(&env);
+        if !Self::is_admin_or_co_admin(&env, &caller, CoAdminPermission::ManageMetadata) {
+            Self::require_co_admin_permission(&env, &caller, CoAdminPermission::ManageMetadata);
+        }
+        metadata::set_metadata(&env, &caller, name, category, description_hash);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// View: the group's metadata, if set.
+    pub fn get_group_metadata(env: Env, _group_id: u32) -> Option<GroupMetadata> {
+        metadata::get_metadata(&env)
+    }
+
+    /// View: this group's public directory listing, including its metadata.
+    pub fn get_directory_entry(env: Env) -> GroupDirectoryEntry {
+        metadata::directory_entry(&env)
     }
 }
 
