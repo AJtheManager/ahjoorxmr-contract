@@ -142,6 +142,9 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey2::ContractVersion, &1u32);
         env.storage().instance().set(&DataKey::Members, &members);
+        for member in members.iter() {
+            internals::increment_membership_count(&env, &member);
+        }
         env.storage()
             .instance()
             .set(&DataKey::PayoutOrder, &resolved_order);
@@ -3156,6 +3159,7 @@ impl AhjoorContract {
             .expect("Not initialized");
         members.push_back(member.clone());
         env.storage().instance().set(&DataKey::Members, &members);
+        internals::increment_membership_count(&env, &member);
 
         // Insert into payout order at target_slot
         let mut payout_order: Vec<Address> = env
@@ -3302,6 +3306,9 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Members, &new_members);
+        if old_members.contains(&member) {
+            internals::decrement_membership_count(&env, &member);
+        }
 
         // Find and mark the member's slot as Vacant in PayoutOrder
         let payout_order: Vec<Address> = env
@@ -4017,6 +4024,7 @@ impl AhjoorContract {
             panic_with_error!(&env, Error::AlreadyAMember);
         }
         charter::require_charter_acknowledged(&env, &new_member);
+        internals::increment_membership_count(&env, &new_member);
         members.push_back(new_member.clone());
         env.storage().instance().set(&DataKey::Members, &members);
 
@@ -4073,6 +4081,7 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Members, &new_members);
+        internals::decrement_membership_count(&env, &member);
 
         // Recalculate payout order: filter out the member
         let old_order: Vec<Address> = env
@@ -7111,6 +7120,9 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Members, &new_members);
+        if old_members.contains(member) {
+            internals::decrement_membership_count(env, member);
+        }
 
         let mut exited_members: Vec<Address> = env
             .storage()
@@ -7783,6 +7795,7 @@ impl AhjoorContract {
             panic_with_error!(&env, Error::AlreadyAMember);
         }
 
+        internals::increment_membership_count(&env, &invitee);
         members.push_back(invitee.clone());
         env.storage().instance().set(&DataKey::Members, &members);
 
@@ -8822,6 +8835,7 @@ impl AhjoorContract {
             .expect("Not initialized");
         members.push_back(new_member.clone());
         env.storage().instance().set(&DataKey::Members, &members);
+        internals::increment_membership_count(env, &new_member);
 
         // Add to payout order at the end
         let mut payout_order: Vec<Address> = env
@@ -9104,6 +9118,7 @@ impl AhjoorContract {
 
         for m in new_members.iter() {
             if !members.contains(&m) {
+                internals::increment_membership_count(&env, &m);
                 members.push_back(m.clone());
                 payout_order.push_back(m.clone());
             }
@@ -12619,9 +12634,9 @@ impl AhjoorContract {
     /// concurrent active group memberships allowed per address.
     ///
     /// - `cap = 0`      — unlimited (default).
-    /// - `cap = 1..255` — hard limit; `add_member` / `join_group_tiered` /
-    ///                    `enroll_from_waitlist` will reject addresses that have
-    ///                    already reached this count.
+    /// - `cap = 1..255` — hard limit; `add_member` / `join_with_invite` /
+    ///                    waitlist promotion / migration and merge joins will
+    ///                    reject addresses that have already reached this count.
     /// - `cap > 255`    — rejected with `InvalidMembershipCap`.
     pub fn set_membership_cap(env: Env, admin: Address, cap: u32) {
         admin.require_auth();
@@ -13325,8 +13340,6 @@ mod test_charter;
 mod test_succession;
 mod test_streak_bonus;
 mod test_payout_vesting;
-mod test_member_obligations;
-mod test_round_extension;
-mod test_penalty_waiver;
-mod test_group_metadata;
+mod test_emergency_payout_treasury;
+mod test_clone_membership_cap;
 pub use events::*;
