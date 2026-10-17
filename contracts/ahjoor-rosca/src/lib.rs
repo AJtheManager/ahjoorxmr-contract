@@ -43,6 +43,10 @@ mod errors;
 mod events;
 mod holdback;
 mod internals;
+mod metadata;
+mod obligations;
+mod penalty_waiver;
+mod round_extension;
 pub mod savings_goal_tracking;
 pub mod savings_goal_tracking_impl;
 mod streak;
@@ -61,6 +65,7 @@ mod clone_client;
 pub use clone_client::RoscaCloneClient;
 mod migration_client;
 pub use migration_client::RoscaMigrationClient;
+pub use obligations::RoscaObligationClient;
 
 use crate::errors::{Error, ExtError, ExtError2};
 
@@ -143,6 +148,9 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey2::ContractVersion, &1u32);
         env.storage().instance().set(&DataKey::Members, &members);
+        for member in members.iter() {
+            internals::increment_membership_count(&env, &member);
+        }
         env.storage()
             .instance()
             .set(&DataKey::PayoutOrder, &resolved_order);
@@ -3169,6 +3177,7 @@ impl AhjoorContract {
             .expect("Not initialized");
         members.push_back(member.clone());
         env.storage().instance().set(&DataKey::Members, &members);
+        internals::increment_membership_count(&env, &member);
 
         // Insert into payout order at target_slot
         let mut payout_order: Vec<Address> = env
@@ -3315,6 +3324,9 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Members, &new_members);
+        if old_members.contains(&member) {
+            internals::decrement_membership_count(&env, &member);
+        }
 
         // Find and mark the member's slot as Vacant in PayoutOrder
         let payout_order: Vec<Address> = env
@@ -3844,7 +3856,9 @@ impl AhjoorContract {
         let mut still_pending: Map<Address, u32> = Map::new(env);
         for (member, pending_round) in pending_penalties.iter() {
             if current_ledger > grace_expires_at || current_round > pending_round {
-                Self::apply_penalty(env, member, penalty_amount, current_round);
+                // Charged against the round it was queued for, so a
+                // `WaivePenalty` proposal can find it under the same round.
+                Self::apply_penalty(env, member, penalty_amount, pending_round);
             } else {
                 still_pending.set(member, pending_round);
             }
@@ -3861,6 +3875,7 @@ impl AhjoorContract {
 
         member.require_auth();
         client.transfer(&member, &env.current_contract_address(), &penalty_amount);
+        let reputation_before = Self::get_reputation_score(env.clone(), member.clone());
 
         let mut default_count: Map<Address, u32> = env
             .storage()
@@ -3885,6 +3900,15 @@ impl AhjoorContract {
         Self::apply_reputation_delta(env, member.clone(), -20, "defaulted");
         // Late-but-paid: member settled after defaulting.
         Self::apply_reputation_delta(env, member.clone(), 5, "late_paid");
+        let reputation_after = Self::get_reputation_score(env.clone(), member.clone());
+        penalty_waiver::record_collected(
+            env,
+            &member,
+            round,
+            &token_addr,
+            penalty_amount,
+            reputation_after - reputation_before,
+        );
 
         let max_defaults: u32 = env
             .storage()
@@ -4019,6 +4043,7 @@ impl AhjoorContract {
         }
         bans::require_not_banned(&env, &new_member);
         charter::require_charter_acknowledged(&env, &new_member);
+        internals::increment_membership_count(&env, &new_member);
         members.push_back(new_member.clone());
         env.storage().instance().set(&DataKey::Members, &members);
 
@@ -4075,6 +4100,7 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Members, &new_members);
+        internals::decrement_membership_count(&env, &member);
 
         // Recalculate payout order: filter out the member
         let old_order: Vec<Address> = env
@@ -4483,7 +4509,30 @@ impl AhjoorContract {
     ) {
         internals::check_not_paused(&env);
         creator.require_auth();
+        Self::create_proposal_internal(
+            &env,
+            creator,
+            proposal_type,
+            description,
+            target_member,
+            voting_duration,
+            execution_data,
+        );
+    }
 
+    /// Shared body of `create_proposal` and the typed proposal helpers
+    /// (`propose_round_extension`, `propose_penalty_waiver`). The caller is
+    /// responsible for `creator.require_auth()`. Returns the proposal id.
+    fn create_proposal_internal(
+        env: &Env,
+        creator: Address,
+        proposal_type: ProposalType,
+        description: soroban_sdk::String,
+        target_member: Address,
+        voting_duration: u64,
+        execution_data: Option<i128>,
+    ) -> u32 {
+        let env = env.clone();
         let members: Vec<Address> = env
             .storage()
             .instance()
@@ -4491,6 +4540,17 @@ impl AhjoorContract {
             .expect("Not initialized");
         if !members.contains(&creator) {
             panic_with_error!(&env, Error::OnlyMembersAllowed);
+        }
+
+        // Reject typed proposals that could never execute.
+        match proposal_type {
+            ProposalType::ExtendRound => {
+                round_extension::validate(&env, execution_data);
+            }
+            ProposalType::WaivePenalty => {
+                penalty_waiver::require_penalty_exists(&env, &target_member, execution_data);
+            }
+            _ => {}
         }
 
         let current_time = env.ledger().timestamp();
@@ -4572,6 +4632,7 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        proposal_id
     }
 
     pub fn get_member_voting_weight(env: Env, member: Address) -> i128 {
@@ -5018,12 +5079,15 @@ impl AhjoorContract {
             ProposalType::PayoutVestingUpdate => {
                 vesting::execute_vesting_update(&env, proposal_id);
             }
-            ProposalType::MemberBan => {
-                bans::ban(
+            ProposalType::ExtendRound => {
+                round_extension::execute(&env, proposal_id, proposal.execution_data);
+            }
+            ProposalType::WaivePenalty => {
+                penalty_waiver::execute(
                     &env,
+                    proposal_id,
                     &proposal.target_member,
-                    &BytesN::from_array(&env, &[0u8; 32]),
-                    &env.current_contract_address(),
+                    proposal.execution_data,
                 );
             }
             ProposalType::MemberFreeze => {
@@ -7002,6 +7066,9 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Members, &new_members);
+        if old_members.contains(member) {
+            internals::decrement_membership_count(env, member);
+        }
 
         let mut exited_members: Vec<Address> = env
             .storage()
@@ -7677,6 +7744,7 @@ impl AhjoorContract {
             panic_with_error!(&env, Error::AlreadyAMember);
         }
 
+        internals::increment_membership_count(&env, &invitee);
         members.push_back(invitee.clone());
         env.storage().instance().set(&DataKey::Members, &members);
 
@@ -8724,6 +8792,7 @@ impl AhjoorContract {
             .expect("Not initialized");
         members.push_back(new_member.clone());
         env.storage().instance().set(&DataKey::Members, &members);
+        internals::increment_membership_count(env, &new_member);
 
         // Add to payout order at the end
         let mut payout_order: Vec<Address> = env
@@ -9010,6 +9079,7 @@ impl AhjoorContract {
         }
         for m in new_members.iter() {
             if !members.contains(&m) {
+                internals::increment_membership_count(&env, &m);
                 members.push_back(m.clone());
                 payout_order.push_back(m.clone());
             }
@@ -12529,9 +12599,9 @@ impl AhjoorContract {
     /// concurrent active group memberships allowed per address.
     ///
     /// - `cap = 0`      — unlimited (default).
-    /// - `cap = 1..255` — hard limit; `add_member` / `join_group_tiered` /
-    ///                    `enroll_from_waitlist` will reject addresses that have
-    ///                    already reached this count.
+    /// - `cap = 1..255` — hard limit; `add_member` / `join_with_invite` /
+    ///                    waitlist promotion / migration and merge joins will
+    ///                    reject addresses that have already reached this count.
     /// - `cap > 255`    — rejected with `InvalidMembershipCap`.
     pub fn set_membership_cap(env: Env, admin: Address, cap: u32) {
         admin.require_auth();
@@ -13040,158 +13110,168 @@ impl AhjoorContract {
         }
     }
 
-    // ── Payout Holdback ───────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Cross-Group Member Obligations ────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// Admin sets the share of each payout withheld until the recipient has
-    /// made their remaining contributions for the cycle, in bps (0 disables,
-    /// max 5_000). Only allowed before the group is activated.
-    pub fn set_payout_holdback_bps(env: Env, admin: Address, bps: u32) {
-        internals::check_not_paused(&env);
-        admin.require_auth();
-        Self::require_admin(&env, &admin);
-        holdback::set_holdback_bps(&env, bps);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
-
-    pub fn get_payout_holdback_bps(env: Env) -> u32 {
-        holdback::holdback_bps(&env)
-    }
-
-    /// Pay `member`'s holdback for `cycle` to their payout beneficiary (or
-    /// themselves) once every contribution they owed after their payout in
-    /// that cycle has been made. Returns the amount paid.
-    pub fn release_holdback(env: Env, _group_id: u32, member: Address, cycle: u32) -> i128 {
-        internals::check_not_paused(&env);
+    /// Member: add another ROSCA group contract to `member`'s obligation
+    /// index on this contract. The member must be active in `group`.
+    pub fn link_member_group(env: Env, member: Address, group: Address) {
         member.require_auth();
-        let amount = holdback::release(&env, &member, cycle);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        amount
+        obligations::link_group(&env, &member, &group);
     }
 
-    pub fn get_holdback(env: Env, member: Address, cycle: u32) -> Option<HoldbackRecord> {
-        holdback::get_record(&env, &member, cycle)
+    /// Member: remove `group` from `member`'s obligation index.
+    pub fn unlink_member_group(env: Env, member: Address, group: Address) {
+        member.require_auth();
+        obligations::unlink_group(&env, &member, &group);
     }
 
-    // ── Maximum Cycle Count ───────────────────────────────────────────────────
+    /// View: the other group contracts linked to `member`'s index.
+    pub fn get_member_group_index(env: Env, member: Address) -> Vec<Address> {
+        obligations::linked_groups(&env, &member)
+    }
 
-    /// Admin sets the number of cycles after which the group completes
-    /// (`None` = unlimited, the default). Only allowed before the group is
-    /// activated.
-    pub fn set_max_cycles(env: Env, admin: Address, max_cycles: Option<u32>) {
-        internals::check_not_paused(&env);
+    /// View: `true` when `member` is an active (not exited or suspended)
+    /// member of this group and the group itself is active.
+    pub fn is_active_group_member(env: Env, member: Address) -> bool {
+        obligations::is_active_member(&env, &member)
+    }
+
+    /// View: what `member` still owes this group for the current round.
+    /// `None` when nothing is due or the member / group is no longer active.
+    pub fn get_group_obligation(env: Env, member: Address) -> Option<MemberObligation> {
+        obligations::local_obligation(&env, &member)
+    }
+
+    /// View: `member`'s outstanding contributions across this group and every
+    /// group in their index, as `(group_id, token, amount_due, deadline)`.
+    /// Exited, completed (dissolved / merged / split) and fully paid groups
+    /// are excluded.
+    pub fn get_member_obligations(env: Env, member: Address) -> Vec<MemberObligation> {
+        obligations::member_obligations(&env, &member)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Member-Voted Round Extension ──────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Admin (or co-admin with `ManageRoundConfig`): set the maximum number of
+    /// seconds an `ExtendRound` proposal may add to a round deadline.
+    /// 0 (default) disables member-voted extensions.
+    pub fn set_max_round_extension(env: Env, admin: Address, max_extra_seconds: u64) {
         admin.require_auth();
-        Self::require_admin(&env, &admin);
-        cycle_limit::set_max_cycles(&env, max_cycles);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
-
-    pub fn get_max_cycles(env: Env) -> Option<u32> {
-        cycle_limit::max_cycles(&env)
-    }
-
-    // ── Member Ban List ───────────────────────────────────────────────────────
-
-    /// Admin bans `member` from joining or rejoining this group by any path.
-    /// An active member must be removed first. Members can also ban an
-    /// address through a `MemberBan` governance proposal.
-    pub fn ban_member(env: Env, _group_id: u32, member: Address, reason_hash: BytesN<32>) {
         internals::check_not_paused(&env);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        admin.require_auth();
-        bans::ban(&env, &member, &reason_hash, &admin);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
-
-    /// Admin lifts a ban. The address must then join through the normal paths.
-    pub fn unban_member(env: Env, _group_id: u32, member: Address) {
-        internals::check_not_paused(&env);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        admin.require_auth();
-        bans::unban(&env, &member, &admin);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
-
-    pub fn is_banned(env: Env, _group_id: u32, member: Address) -> bool {
-        bans::is_banned(&env, &member)
-    }
-
-    // ── Upcoming Payouts ──────────────────────────────────────────────────────
-
-    /// The next `count` payouts (capped at `MAX_UPCOMING_PAYOUTS`) as
-    /// `(recipient, round, expected_at)`, where `expected_at` is the round's
-    /// contribution deadline. Recipients are chosen exactly as the payout
-    /// logic does from the current payout order, so executed slot swaps,
-    /// auction results, skips and suspensions are reflected. Empty once the
-    /// group is no longer active; stops at the final round when `max_cycles`
-    /// is set.
-    pub fn get_upcoming_payouts(env: Env, _group_id: u32, count: u32) -> Vec<(Address, u32, u64)> {
-        let mut upcoming: Vec<(Address, u32, u64)> = Vec::new(&env);
-        if Self::get_group_status(env.clone()) != GroupStatus::Active {
-            return upcoming;
+        if !Self::is_admin_or_co_admin(&env, &admin, CoAdminPermission::ManageRoundConfig) {
+            Self::require_co_admin_permission(&env, &admin, CoAdminPermission::ManageRoundConfig);
         }
-        let payout_order: Vec<Address> = env
-            .storage()
+        round_extension::set_max_extension(&env, max_extra_seconds);
+        events::emit_max_round_extension_set(&env, admin, max_extra_seconds);
+        env.storage()
             .instance()
-            .get(&DataKey::PayoutOrder)
-            .unwrap_or(Vec::new(&env));
-        let suspended_members: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SuspendedMembers)
-            .unwrap_or(Vec::new(&env));
-        let exited_members: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ExitedMembers)
-            .unwrap_or(Vec::new(&env));
-        let skip_requests: Map<(Address, u32), bool> = env
-            .storage()
-            .instance()
-            .get(&DataKey2::SkipRequests)
-            .unwrap_or(Map::new(&env));
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
 
-        let (current_round, current_deadline, round_duration) = internals::round_schedule(&env);
-        // Rounds from `end_round` on are never played.
-        let end_round: Option<u32> =
-            cycle_limit::max_cycles(&env).map(|m| m.saturating_mul(payout_order.len()));
+    /// View: maximum `extra_seconds` allowed per extension (0 = disabled).
+    pub fn get_max_round_extension(env: Env) -> u64 {
+        round_extension::max_extension(&env)
+    }
 
-        for i in 0..count.min(MAX_UPCOMING_PAYOUTS) {
-            let round = current_round + i;
-            if end_round.map_or(false, |end| round >= end) {
-                break;
-            }
-            let idx = match internals::select_payout_slot(
-                &payout_order,
-                round,
-                &suspended_members,
-                &exited_members,
-                &skip_requests,
-            ) {
-                Some(idx) => idx,
-                None => break,
-            };
-            let expected_at = current_deadline + i as u64 * round_duration;
-            upcoming.push_back((payout_order.get(idx).unwrap(), round, expected_at));
+    /// View: cycle in which the last round extension was applied, if any.
+    pub fn get_last_extended_cycle(env: Env) -> Option<u32> {
+        round_extension::last_extended_cycle(&env)
+    }
+
+    /// Member: open an `ExtendRound` proposal adding `extra_seconds` to the
+    /// current round deadline. Returns the proposal id. Voting must close
+    /// before the current deadline for the proposal to be executable.
+    pub fn propose_round_extension(
+        env: Env,
+        proposer: Address,
+        extra_seconds: u64,
+        voting_duration: u64,
+    ) -> u32 {
+        internals::check_not_paused(&env);
+        proposer.require_auth();
+        Self::create_proposal_internal(
+            &env,
+            proposer.clone(),
+            ProposalType::ExtendRound,
+            String::from_str(&env, "Extend round deadline"),
+            proposer,
+            voting_duration,
+            Some(extra_seconds as i128),
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Late-Fee Waiver ───────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Member: open a `WaivePenalty` proposal for `member`'s penalty in
+    /// `round` (the round reported by `get_pending_penalties` or
+    /// `get_collected_penalty`). Returns the proposal id.
+    pub fn propose_penalty_waiver(
+        env: Env,
+        proposer: Address,
+        member: Address,
+        round: u32,
+        voting_duration: u64,
+    ) -> u32 {
+        internals::check_not_paused(&env);
+        proposer.require_auth();
+        Self::create_proposal_internal(
+            &env,
+            proposer,
+            ProposalType::WaivePenalty,
+            String::from_str(&env, "Waive late penalty"),
+            member,
+            voting_duration,
+            Some(round as i128),
+        )
+    }
+
+    /// View: penalty collected from `member` for `round`, if any.
+    pub fn get_collected_penalty(env: Env, member: Address, round: u32) -> Option<CollectedPenaltyRecord> {
+        penalty_waiver::get_collected(&env, &member, round)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Group Metadata ────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Admin (or co-admin with `ManageMetadata`): set the group's display
+    /// name (1..=64 bytes), category and description hash.
+    ///
+    /// `group_id` is accepted for API consistency with other group-scoped
+    /// functions; this contract manages a single group per instance.
+    pub fn set_group_metadata(
+        env: Env,
+        caller: Address,
+        _group_id: u32,
+        name: String,
+        category: Symbol,
+        description_hash: BytesN<32>,
+    ) {
+        caller.require_auth();
+        internals::check_not_paused(&env);
+        if !Self::is_admin_or_co_admin(&env, &caller, CoAdminPermission::ManageMetadata) {
+            Self::require_co_admin_permission(&env, &caller, CoAdminPermission::ManageMetadata);
         }
-        upcoming
+        metadata::set_metadata(&env, &caller, name, category, description_hash);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// View: the group's metadata, if set.
+    pub fn get_group_metadata(env: Env, _group_id: u32) -> Option<GroupMetadata> {
+        metadata::get_metadata(&env)
+    }
+
+    /// View: this group's public directory listing, including its metadata.
+    pub fn get_directory_entry(env: Env) -> GroupDirectoryEntry {
+        metadata::directory_entry(&env)
     }
 }
 
@@ -13225,8 +13305,6 @@ mod test_charter;
 mod test_succession;
 mod test_streak_bonus;
 mod test_payout_vesting;
-mod test_payout_holdback;
-mod test_max_cycles;
-mod test_ban_list;
-mod test_upcoming_payouts;
+mod test_emergency_payout_treasury;
+mod test_clone_membership_cap;
 pub use events::*;

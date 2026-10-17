@@ -1,4 +1,4 @@
-use crate::{errors::{Error, ExtError}, events, audit_trail, cycle_limit, holdback, streak, vesting, ContributionEntry, CycleSnapshotData, DataKey, DataKey2, DataKey3, DataKey4, DataKey5, PersistentKey, PayoutRecord, SlotBid, types::{InsuranceClaim, InsuranceCoverageMode}};
+use crate::{errors::{Error, ExtError, ExtError2}, events, audit_trail, streak, vesting, ContributionEntry, CycleSnapshotData, DataKey, DataKey2, DataKey3, DataKey4, DataKey5, PersistentKey, PayoutRecord, SlotBid, types::{InsuranceClaim, InsuranceCoverageMode}};
 use soroban_sdk::{panic_with_error, token, Address, Bytes, BytesN, Env, Map, Vec};
 
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
@@ -966,6 +966,58 @@ pub(crate) fn execute_max_members_update(env: &Env, new_max_val: Option<i128>) {
     }
 }
 
+fn load_membership_counts(env: &Env) -> Map<Address, u32> {
+    env.storage()
+        .persistent()
+        .get(&DataKey5::MembershipCount)
+        .unwrap_or(Map::new(env))
+}
+
+fn save_membership_counts(env: &Env, counts: &Map<Address, u32>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey5::MembershipCount, counts);
+    env.storage().persistent().extend_ttl(
+        &DataKey5::MembershipCount,
+        PERSISTENT_LIFETIME_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+}
+
+/// Enforces the concurrent-membership cap (`MaxConcurrentMemberships`,
+/// 0 = unlimited) for `member` and records one more active membership.
+/// Call whenever an address is added to the members list.
+pub(crate) fn increment_membership_count(env: &Env, member: &Address) {
+    let cap: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey5::MaxConcurrentMemberships)
+        .unwrap_or(0);
+    let mut counts = load_membership_counts(env);
+    let count = counts.get(member.clone()).unwrap_or(0);
+    if cap > 0 && count >= cap {
+        panic_with_error!(env, ExtError2::MembershipCapReached);
+    }
+    counts.set(member.clone(), count + 1);
+    save_membership_counts(env, &counts);
+}
+
+/// Releases one active membership for `member`. Call whenever an address
+/// is removed from the members list.
+pub(crate) fn decrement_membership_count(env: &Env, member: &Address) {
+    let mut counts = load_membership_counts(env);
+    let count = counts.get(member.clone()).unwrap_or(0);
+    if count == 0 {
+        return;
+    }
+    if count == 1 {
+        counts.remove(member.clone());
+    } else {
+        counts.set(member.clone(), count - 1);
+    }
+    save_membership_counts(env, &counts);
+}
+
 /// Removes a member from both the members list and the payout order.
 pub(crate) fn execute_member_removal(env: &Env, member: &Address) {
     let old_members: Vec<Address> = env
@@ -973,6 +1025,9 @@ pub(crate) fn execute_member_removal(env: &Env, member: &Address) {
         .instance()
         .get(&DataKey::Members)
         .unwrap_or(Vec::new(env));
+    if old_members.contains(member) {
+        decrement_membership_count(env, member);
+    }
     let mut new_members: Vec<Address> = Vec::new(env);
     for m in old_members.iter() {
         if m != *member {

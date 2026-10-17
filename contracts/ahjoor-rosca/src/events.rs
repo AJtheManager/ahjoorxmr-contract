@@ -2477,124 +2477,111 @@ pub fn emit_vesting_covered_default(
     VestingCoveredDefault { member, round, amount, fully_covered }.publish(e);
 }
 
-// ── Payout Holdback ───────────────────────────────────────────────────────────
+// ── Cross-Group Member Obligations ────────────────────────────────────────────
 
+/// Event: A member linked another group contract to their obligation index.
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct PayoutHoldbackSet {
-    pub holdback_bps: u32,
+pub struct MemberGroupLinked {
+    pub member: Address,
+    pub group: Address,
 }
 
-pub fn emit_payout_holdback_set(e: &Env, holdback_bps: u32) {
-    PayoutHoldbackSet { holdback_bps }.publish(e);
+pub fn emit_member_group_linked(e: &Env, member: Address, group: Address) {
+    MemberGroupLinked { member, group }.publish(e);
 }
 
-/// Event: Part of a round payout was withheld until the recipient makes
-/// their remaining contributions for `cycle` (through `last_round`).
+/// Event: A member removed a group contract from their obligation index.
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct PayoutHeldBack {
+pub struct MemberGroupUnlinked {
+    pub member: Address,
+    pub group: Address,
+}
+
+pub fn emit_member_group_unlinked(e: &Env, member: Address, group: Address) {
+    MemberGroupUnlinked { member, group }.publish(e);
+}
+
+// ── Round Deadline Extension ──────────────────────────────────────────────────
+
+/// Event: Admin set the maximum member-voted round extension.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MaxRoundExtensionSet {
+    pub admin: Address,
+    pub max_extra_seconds: u64,
+}
+
+pub fn emit_max_round_extension_set(e: &Env, admin: Address, max_extra_seconds: u64) {
+    MaxRoundExtensionSet { admin, max_extra_seconds }.publish(e);
+}
+
+/// Event: An approved `ExtendRound` proposal moved the current round deadline.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RoundDeadlineExtended {
+    pub proposal_id: u32,
     pub round: u32,
-    pub member: Address,
     pub cycle: u32,
-    pub amount: i128,
-    pub last_round: u32,
+    pub extra_seconds: u64,
+    pub new_deadline: u64,
 }
 
-pub fn emit_payout_held_back(
+pub fn emit_round_deadline_extended(
     e: &Env,
+    proposal_id: u32,
     round: u32,
-    member: Address,
     cycle: u32,
-    amount: i128,
-    last_round: u32,
+    extra_seconds: u64,
+    new_deadline: u64,
 ) {
-    PayoutHeldBack { round, member, cycle, amount, last_round }.publish(e);
+    RoundDeadlineExtended { proposal_id, round, cycle, extra_seconds, new_deadline }.publish(e);
 }
 
+// ── Late-Fee Waiver ───────────────────────────────────────────────────────────
+
+/// Event: An approved `WaivePenalty` proposal cleared or refunded a penalty.
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct HoldbackReleased {
+pub struct PenaltyWaived {
+    pub proposal_id: u32,
     pub member: Address,
-    pub cycle: u32,
-    pub recipient: Address,
-    pub amount: i128,
-}
-
-pub fn emit_holdback_released(e: &Env, member: Address, cycle: u32, recipient: Address, amount: i128) {
-    HoldbackReleased { member, cycle, recipient, amount }.publish(e);
-}
-
-/// Event: A holdback was settled because the member missed a contribution
-/// for `round` (or left the group). `covered` went into the round pot and
-/// `forfeited` into the insurance pool.
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct HoldbackForfeited {
-    pub member: Address,
-    pub cycle: u32,
     pub round: u32,
-    pub covered: i128,
-    pub forfeited: i128,
+    /// `true` when the penalty had already been collected and was refunded.
+    pub was_collected: bool,
+    pub refunded_amount: i128,
 }
 
-pub fn emit_holdback_forfeited(
+pub fn emit_penalty_waived(
     e: &Env,
+    proposal_id: u32,
     member: Address,
-    cycle: u32,
     round: u32,
-    covered: i128,
-    forfeited: i128,
+    was_collected: bool,
+    refunded_amount: i128,
 ) {
-    HoldbackForfeited { member, cycle, round, covered, forfeited }.publish(e);
+    PenaltyWaived { proposal_id, member, round, was_collected, refunded_amount }.publish(e);
 }
 
-// ── Maximum Cycle Count ───────────────────────────────────────────────────────
+// ── Group Metadata ────────────────────────────────────────────────────────────
 
+/// Event: Group metadata was set or changed.
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct MaxCyclesSet {
-    pub max_cycles: Option<u32>,
+pub struct GroupMetadataUpdated {
+    pub updated_by: Address,
+    pub name: soroban_sdk::String,
+    pub category: Symbol,
+    pub description_hash: BytesN<32>,
 }
 
-pub fn emit_max_cycles_set(e: &Env, max_cycles: Option<u32>) {
-    MaxCyclesSet { max_cycles }.publish(e);
-}
-
-/// Event: The group finished its final cycle. `distributed` is the reserve
-/// and insurance balance paid back to members.
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct GroupCompleted {
-    pub cycles: u32,
-    pub distributed: i128,
-}
-
-pub fn emit_group_completed(e: &Env, cycles: u32, distributed: i128) {
-    GroupCompleted { cycles, distributed }.publish(e);
-}
-
-// ── Member Ban List ───────────────────────────────────────────────────────────
-
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct MemberBanned {
-    pub member: Address,
-    pub banned_by: Address,
-    pub reason_hash: BytesN<32>,
-}
-
-pub fn emit_member_banned(e: &Env, member: Address, banned_by: Address, reason_hash: BytesN<32>) {
-    MemberBanned { member, banned_by, reason_hash }.publish(e);
-}
-
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct MemberUnbanned {
-    pub member: Address,
-    pub unbanned_by: Address,
-}
-
-pub fn emit_member_unbanned(e: &Env, member: Address, unbanned_by: Address) {
-    MemberUnbanned { member, unbanned_by }.publish(e);
+pub fn emit_group_metadata_updated(
+    e: &Env,
+    updated_by: Address,
+    name: soroban_sdk::String,
+    category: Symbol,
+    description_hash: BytesN<32>,
+) {
+    GroupMetadataUpdated { updated_by, name, category, description_hash }.publish(e);
 }

@@ -2139,6 +2139,17 @@ impl AhjoorPaymentsContract {
             .expect("Not initialized");
         admin.require_auth();
 
+        Self::resolve_dispute_internal(env, admin, payment_id, release_to_merchant);
+    }
+
+    /// Settles a dispute; the caller must already have authenticated `admin`
+    /// (a second `require_auth` for the same address in one invocation fails).
+    fn resolve_dispute_internal(
+        env: Env,
+        admin: Address,
+        payment_id: u32,
+        release_to_merchant: bool,
+    ) {
         let mut payment: Payment = env
             .storage()
             .persistent()
@@ -2456,7 +2467,7 @@ impl AhjoorPaymentsContract {
         );
 
         // Resolve the underlying dispute
-        Self::resolve_dispute(env, payment_id, winner);
+        Self::resolve_dispute_internal(env, admin, payment_id, winner);
     }
 
     /// Create payment with cooling-off period (#309)
@@ -11596,5 +11607,9 @@ mod test_get_withdrawal_limit;
 mod test_get_max_invoices_per_period;
 mod test_get_default_withdrawal_limits;
 mod test_get_payment_expiry_bounds;
+#[cfg(test)]
+mod test_merchant_tokens_swap_router;
+#[cfg(test)]
+mod test_unblock_evidence_dispute;
 
 pub use events::*;
