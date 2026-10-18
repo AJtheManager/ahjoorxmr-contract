@@ -593,6 +593,8 @@ pub struct Dispute {
     pub resolved: bool,
     pub dispute_amount: i128,
     pub timeout_seconds: Option<u64>,
+    pub filing_fee: i128,
+    pub filing_party: Address,
 }
 
 /// #571: Insurance claim details recorded for an escrow.
@@ -906,6 +908,10 @@ pub enum DataKey3 {
     FeeSponsorship(u32),
     /// #977: open mutual settlement offer for a disputed escrow
     SettlementOffer(u32),
+    /// Dispute filing fee in basis points (default 0 = disabled)
+    DisputeFilingFeeBps,
+    /// Accumulated dispute fees held by contract per token
+    DisputeFeePool(Address),
 }
 
 /// A third party's pre-funded protocol fee for a specific escrow.

@@ -83,4 +83,51 @@ pub trait TokenWhitelistInterface {
         offset: u32,
         limit: u32,
     ) -> soroban_sdk::Vec<crate::SuspensionRecord>;
+
+    // ==================== TIMELOCKED TOKEN REMOVAL ====================
+
+    /// Schedule a token removal with a timelock
+    fn schedule_token_removal(
+        env: Env,
+        admin: Address,
+        token: Address,
+        removal_delay_ledgers: u32,
+        reason_hash: BytesN<32>,
+    );
+
+    /// Cancel a scheduled token removal
+    fn cancel_token_removal(env: Env, admin: Address, token: Address);
+
+    /// Execute a scheduled token removal once the timelock expires
+    fn execute_token_removal(env: Env, token: Address);
+
+    /// Get the scheduled removal request for a token
+    fn get_token_removal_request(env: Env, token: Address) -> Option<crate::TokenRemovalRequest>;
+
+    // ==================== TOKEN CATEGORY TAGS ====================
+
+    /// Assign a category to a token
+    fn assign_token_category(
+        env: Env,
+        admin: Address,
+        token: Address,
+        category: crate::TokenCategory,
+    );
+
+    /// Remove category assignment from a token
+    fn remove_token_category(env: Env, admin: Address, token: Address);
+
+    /// Get the category assigned to a token
+    fn get_token_category(env: Env, token: Address) -> Option<crate::TokenCategory>;
+
+    /// Get all tokens in a specific category
+    fn get_tokens_by_category(
+        env: Env,
+        category: crate::TokenCategory,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<Address>;
+
+    /// Get the count of tokens in a specific category
+    fn get_category_token_count(env: Env, category: crate::TokenCategory) -> u32;
 }
