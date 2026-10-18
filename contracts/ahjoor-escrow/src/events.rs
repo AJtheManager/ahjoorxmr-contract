@@ -1227,6 +1227,55 @@ pub fn emit_seller_marked_complete(e: &Env, escrow_id: u32, seller: Address) {
     SellerMarkedComplete { escrow_id, seller }.publish(e);
 }
 
+// ── #1062: Deadline Reminder Events ──────────────────────────────────────────
+
+/// Event: Emitted by `emit_deadline_reminders` when an escrow is approaching
+/// its deadline and has not yet received a reminder.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EscrowDeadlineApproaching {
+    pub escrow_id: u32,
+    pub deadline: u64,
+    pub ledger_timestamp: u64,
+}
+
+pub fn emit_escrow_deadline_approaching(e: &Env, escrow_id: u32, deadline: u64) {
+    EscrowDeadlineApproaching {
+        escrow_id,
+        deadline,
+        ledger_timestamp: e.ledger().timestamp(),
+    }
+    .publish(e);
+}
+
+// ── #1067: Arbiter Ruling Rationale Events ────────────────────────────────────
+
+/// Event: Arbiter verdict recorded (with rationale hash).
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ArbiterVerdictRecorded {
+    pub escrow_id: u32,
+    pub arbiter: Address,
+    pub buyer_percent: u32,
+    pub rationale_hash: BytesN<32>,
+}
+
+pub fn emit_arbiter_verdict_recorded(
+    e: &Env,
+    escrow_id: u32,
+    arbiter: Address,
+    buyer_percent: u32,
+    rationale_hash: BytesN<32>,
+) {
+    ArbiterVerdictRecorded {
+        escrow_id,
+        arbiter,
+        buyer_percent,
+        rationale_hash,
+    }
+    .publish(e);
+}
+
 pub fn emit_inspector_replaced(e: &Env, escrow_id: u32, old_inspector: Address, new_inspector: Address) {
     InspectorReplaced { escrow_id, old_inspector, new_inspector }.publish(e);
 }
