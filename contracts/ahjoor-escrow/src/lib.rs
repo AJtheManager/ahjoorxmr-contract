@@ -1161,6 +1161,18 @@ pub struct PendingVerdict {
     pub buyer_percent: u32,
     pub arbiter: Address,
     pub recorded_at: u64,
+    /// #1067: IPFS/SHA-256 hash of the off-chain rationale document.
+    pub rationale_hash: BytesN<32>,
+}
+
+/// #1067: Stored ruling record returned by `get_ruling`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRuling {
+    pub buyer_percent: u32,
+    pub arbiter: Address,
+    pub rationale_hash: BytesN<32>,
+    pub recorded_at: u64,
 }
 
 mod oracle {
@@ -3348,7 +3360,7 @@ impl AhjoorEscrowContract {
     /// Use 100 for full buyer win, 0 for full seller win, or any value in between for a split.
     /// If a cooling-off window is configured, the escrow enters CoolingOff state and funds
     /// are NOT moved until `finalize_resolution` is called after the window expires.
-    pub fn resolve_dispute(env: Env, arbiter: Address, escrow_id: u32, buyer_percent: u32) {
+    pub fn resolve_dispute(env: Env, arbiter: Address, escrow_id: u32, buyer_percent: u32, rationale_hash: BytesN<32>) {
         Self::require_not_paused(&env);
         arbiter.require_auth();
 
@@ -3389,6 +3401,7 @@ impl AhjoorEscrowContract {
                 buyer_percent,
                 arbiter: arbiter.clone(),
                 recorded_at: env.ledger().timestamp(),
+                rationale_hash: rationale_hash.clone(),
             };
             env.storage()
                 .persistent()
@@ -3415,6 +3428,7 @@ impl AhjoorEscrowContract {
                 PERSISTENT_BUMP_AMOUNT,
             );
 
+            events::emit_arbiter_verdict_recorded(&env, escrow_id, arbiter.clone(), buyer_percent, rationale_hash);
             events::emit_resolution_cooling_off(&env, escrow_id, buyer_percent, arbiter, env.ledger().timestamp() + cooling_off_seconds);
 
             env.storage()
@@ -3424,7 +3438,8 @@ impl AhjoorEscrowContract {
         }
 
         // No cooling-off configured — execute immediately (legacy path)
-        Self::execute_verdict(&env, escrow_id, escrow, buyer_percent, arbiter);
+        events::emit_arbiter_verdict_recorded(&env, escrow_id, arbiter.clone(), buyer_percent, rationale_hash.clone());
+        Self::execute_verdict(&env, escrow_id, escrow, buyer_percent, arbiter, rationale_hash);
 
         env.storage()
             .instance()
@@ -3546,11 +3561,12 @@ impl AhjoorEscrowContract {
 
         let buyer_percent = verdict.buyer_percent;
         let arbiter = verdict.arbiter.clone();
+        let rationale_hash = verdict.rationale_hash.clone();
 
         // Clean up verdict
         env.storage().persistent().remove(&DataKey2::PendingVerdict(escrow_id));
 
-        Self::execute_verdict(&env, escrow_id, escrow, buyer_percent, arbiter);
+        Self::execute_verdict(&env, escrow_id, escrow, buyer_percent, arbiter, rationale_hash);
 
         env.storage()
             .instance()
@@ -3603,7 +3619,7 @@ impl AhjoorEscrowContract {
     }
 
     /// Internal: execute a verdict (transfer funds per buyer_percent split).
-    fn execute_verdict(env: &Env, escrow_id: u32, mut escrow: Escrow, buyer_percent: u32, arbiter: Address) {
+    fn execute_verdict(env: &Env, escrow_id: u32, mut escrow: Escrow, buyer_percent: u32, arbiter: Address, rationale_hash: BytesN<32>) {
         let client = token::Client::new(env, &escrow.token);
 
         let arbiter_fee_bps = Self::effective_arbiter_fee_bps(env, &escrow);
@@ -3780,7 +3796,23 @@ impl AhjoorEscrowContract {
         );
         let release_to_seller = buyer_percent == 0;
         events::emit_dispute_resolved(env, escrow_id, release_to_seller, arbiter.clone());
-        events::emit_resolution_finalized(env, escrow_id, buyer_percent, arbiter);
+        events::emit_resolution_finalized(env, escrow_id, buyer_percent, arbiter.clone());
+
+        // #1067: Persist the finalized ruling for future retrieval via get_ruling.
+        let ruling = EscrowRuling {
+            buyer_percent,
+            arbiter: arbiter.clone(),
+            rationale_hash: rationale_hash.clone(),
+            recorded_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey3::EscrowRuling(escrow_id), &ruling);
+        env.storage().persistent().extend_ttl(
+            &DataKey3::EscrowRuling(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // #357: Update inspector reputation score on each ruling
         if let Some(inspector) = escrow.extensions.inspector.clone() {
@@ -10915,6 +10947,159 @@ impl AhjoorEscrowContract {
             .persistent()
             .remove(&DataKey3::CreationBond(escrow_id));
         events::emit_creation_bond_refunded(env, escrow_id, escrow.buyer.clone(), bond);
+    }
+
+    // ── #1067: Arbiter Ruling Rationale ──────────────────────────────────────
+
+    /// Returns the finalized ruling for a resolved dispute, including the
+    /// verdict split, the arbiter, and the off-chain rationale hash.
+    /// Returns `None` when no ruling has been recorded for the escrow.
+    pub fn get_ruling(env: Env, escrow_id: u32) -> Option<EscrowRuling> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::EscrowRuling(escrow_id))
+    }
+
+    // ── #1062: Deadline Reminder Keeper Function ──────────────────────────────
+
+    /// Admin: configure the reminder window (seconds before deadline).
+    /// Defaults to 48 hours if not explicitly set.
+    pub fn set_deadline_reminder_window(env: Env, admin: Address, window_seconds: u64) {
+        Self::require_admin(&env, &admin);
+        if window_seconds == 0 {
+            panic_with_error!(&env, EscrowErrorExt::DeadlineMustBePositive);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey3::DeadlineReminderWindowSeconds, &window_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    pub fn get_deadline_reminder_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey3::DeadlineReminderWindowSeconds)
+            .unwrap_or(48 * 60 * 60) // default: 48 hours
+    }
+
+    /// Keeper-callable function that emits `EscrowDeadlineApproaching` events
+    /// for escrows whose deadline falls within the configured reminder window.
+    ///
+    /// - Escrows that are not Active are skipped.
+    /// - At most one reminder is emitted per escrow (deduplicated via
+    ///   `DataKey3::DeadlineReminderSent`).
+    /// - The batch is capped at `DEFAULT_MAX_BATCH_ESCROWS` (10) entries.
+    ///
+    /// No auth required — any keeper/bot may trigger this.
+    pub fn emit_deadline_reminders(env: Env, escrow_ids: Vec<u64>) {
+        Self::require_not_paused(&env);
+
+        let cap = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MaxEscrowBatchSize)
+            .unwrap_or(DEFAULT_MAX_BATCH_ESCROWS);
+
+        let window_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::DeadlineReminderWindowSeconds)
+            .unwrap_or(48 * 60 * 60);
+
+        let now = env.ledger().timestamp();
+        let mut processed: u32 = 0;
+
+        for raw_id in escrow_ids.iter() {
+            if processed >= cap {
+                break;
+            }
+
+            let escrow_id = raw_id as u32;
+
+            // Only Active escrows need reminders
+            let maybe_escrow: Option<Escrow> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Escrow(escrow_id));
+            let escrow = match maybe_escrow {
+                Some(e) => e,
+                None => continue,
+            };
+
+            if escrow.status != EscrowStatus::Active {
+                continue;
+            }
+
+            // Deadline must be in the future but within the reminder window
+            if escrow.deadline <= now {
+                continue;
+            }
+            if escrow.deadline > now + window_seconds {
+                continue;
+            }
+
+            // Suppress duplicate reminders
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey3::DeadlineReminderSent(escrow_id))
+            {
+                continue;
+            }
+
+            // Mark as reminded (TTL covers the deadline window + some buffer)
+            env.storage()
+                .persistent()
+                .set(&DataKey3::DeadlineReminderSent(escrow_id), &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey3::DeadlineReminderSent(escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            events::emit_escrow_deadline_approaching(&env, escrow_id, escrow.deadline);
+            processed += 1;
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // ── #1097: Deployment Manifest View ──────────────────────────────────────
+
+    /// Returns a snapshot of the core deployment state: version, admin,
+    /// paused flag, and linked contract addresses.  Read-only and cheap.
+    pub fn get_manifest(env: Env) -> EscrowManifest {
+        let version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(1);
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        let token_whitelist: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelistContract);
+        let oracle: Option<Address> = env.storage().instance().get(&DataKey::OracleAddress);
+        let insurance_token: Option<Address> =
+            env.storage().instance().get(&DataKey::InsuranceToken);
+
+        EscrowManifest {
+            version,
+            admin,
+            paused,
+            token_whitelist_contract: token_whitelist,
+            oracle_contract: oracle,
+            insurance_token,
+        }
     }
 
 }
