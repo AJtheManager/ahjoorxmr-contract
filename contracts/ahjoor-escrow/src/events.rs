@@ -1841,32 +1841,33 @@ pub fn emit_arbiter_recused(e: &Env, escrow_id: u32, old_arbiter: Address, new_a
     ArbiterRecused { escrow_id, old_arbiter, new_arbiter, reason_hash }.publish(e);
 }
 
-// --- Revision Request Events ---
+// ── #586: Escrow Document Attachment Events ──────────────────────────────────
 
-pub fn emit_revision_requested(e: &Env, escrow_id: u32, request_id: u32, buyer: Address) {
-    e.events().publish(
-        (Symbol::new(e, "RevisionRequested"),),
-        (escrow_id, request_id, buyer),
-    );
+/// Event: A document hash was attached to an escrow by a party.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DocumentAttached {
+    pub escrow_id: u32,
+    pub party: Address,
+    pub doc_hash: BytesN<32>,
+    pub kind: Symbol,
+    pub attached_at: u64,
 }
 
-pub fn emit_revision_acknowledged(e: &Env, escrow_id: u32, request_id: u32, seller: Address) {
-    e.events().publish(
-        (Symbol::new(e, "RevisionAcknowledged"),),
-        (escrow_id, request_id, seller),
-    );
-}
-
-pub fn emit_revision_rejected(e: &Env, escrow_id: u32, request_id: u32, reason_hash: BytesN<32>) {
-    e.events().publish(
-        (Symbol::new(e, "RevisionRejected"),),
-        (escrow_id, request_id, reason_hash),
-    );
-}
-
-pub fn emit_revision_escalated_to_dispute(e: &Env, escrow_id: u32, request_id: u32) {
-    e.events().publish(
-        (Symbol::new(e, "RevisionEscalated"),),
-        (escrow_id, request_id),
-    );
+pub fn emit_document_attached(
+    e: &Env,
+    escrow_id: u32,
+    party: Address,
+    doc_hash: BytesN<32>,
+    kind: Symbol,
+    attached_at: u64,
+) {
+    DocumentAttached {
+        escrow_id,
+        party,
+        doc_hash,
+        kind,
+        attached_at,
+    }
+    .publish(e);
 }
