@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Map, String, Symbol, Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
@@ -147,7 +147,11 @@ pub enum ProposalType {
     MemberFreeze = 5,  // Member-initiated emergency freeze
     CharterUpdate = 6, // Replace the group charter after activation
     PayoutVestingUpdate = 7, // Change payout_vesting_ledgers after activation
-    HardshipReduction = 8, // One-round contribution reduction covered by the emergency reserve
+    /// Extend the current round's contribution deadline. `execution_data`
+    /// carries `extra_seconds`, bounded by `MaxRoundExtensionSeconds`.
+    ExtendRound = 8,
+    /// Waive `target_member`'s penalty for the round in `execution_data`.
+    WaivePenalty = 9,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -496,23 +500,24 @@ pub enum DataKey5 {
     /// u32 — vesting period awaiting a `PayoutVestingUpdate` proposal (persistent).
     PendingVestingLedgers(u32),
 
-    // ── Member Payout History (#1028) ─────────────────────────────────────────
-    /// u32 — number of payout entries recorded for a member (persistent).
-    MemberPayoutCount(Address),
-    /// MemberPayoutEntry — (member, index) → payout entry (persistent).
-    MemberPayoutEntry(Address, u32),
+    // ── Payout Holdback ───────────────────────────────────────────────────────
+    /// u32 — share of each payout withheld until the recipient's remaining
+    /// contributions for the cycle are made, in bps (0 = disabled, max 5000).
+    PayoutHoldbackBps,
+    /// HoldbackRecord — amount withheld from (member, cycle)'s payout (persistent).
+    Holdback(Address, u32),
+    /// Map<Address, u32> — member → cycle of their newest unsettled holdback.
+    HoldbackOpen,
+    /// i128 — base-token balance withheld in unsettled holdbacks.
+    HoldbackLocked,
 
-    // ── Hardship Contribution Reduction (#1030) ───────────────────────────────
-    /// HardshipRequest — proposal_id → hardship request (persistent).
-    HardshipRequest(u32),
-    /// u32 — (member, cycle) → proposal_id of the member's latest request (persistent).
-    HardshipCycleRequest(Address, u32),
-    /// HardshipRequest — (member, round) → approved reduction (persistent).
-    HardshipReduction(Address, u32),
-    /// Vec<Address> — round → members with an approved reduction (persistent).
-    HardshipRoundMembers(u32),
-    /// i128 — reserve funds drawn for approved reductions, not yet settled.
-    HardshipEarmarked,
+    // ── Maximum Cycle Count ───────────────────────────────────────────────────
+    /// u32 — number of cycles after which the group completes. Absent = unlimited.
+    MaxCycles,
+
+    // ── Member Ban List ───────────────────────────────────────────────────────
+    /// BytesN<32> — reason hash for a banned address (persistent). Absent = not banned.
+    Banned(Address),
 }
 
 // ── Contribution Streak Bonus ─────────────────────────────────────────────────
@@ -560,6 +565,37 @@ pub struct VestingRecord {
     pub covered: i128,
 }
 
+// ── Payout Holdback ───────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HoldbackStatus {
+    /// Withheld; releasable once the member's remaining contributions are made.
+    Held = 0,
+    /// Paid out to the member (or their payout beneficiary).
+    Released = 1,
+    /// Applied to a missed contribution; the rest went to the insurance pool.
+    Forfeited = 2,
+}
+
+/// Share of a payout withheld from `member` in `cycle`. The member owes
+/// contributions for rounds `payout_round + 1 ..= last_round`; once those are
+/// made the holdback can be released.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HoldbackRecord {
+    pub member: Address,
+    pub cycle: u32,
+    pub amount: i128,
+    pub payout_round: u32,
+    pub last_round: u32,
+    /// Part of `amount` used to cover a missed contribution.
+    pub covered: i128,
+    /// Part of `amount` forfeited to the group's insurance pool.
+    pub forfeited: i128,
+    pub status: HoldbackStatus,
+}
+
 // ── Group Charter ─────────────────────────────────────────────────────────────
 
 /// Off-chain rules document anchored by hash. `version` starts at 1 and is
@@ -605,6 +641,8 @@ pub enum CoAdminPermission {
     ManageTokens = 4,
     /// Can update round configuration (duration, grace period, etc.).
     ManageRoundConfig = 5,
+    /// Can update group metadata (name, category, description hash).
+    ManageMetadata = 6,
 }
 
 /// Record stored per co-admin address.
@@ -873,6 +911,8 @@ pub enum GroupStatus {
     Merged = 2,
     /// Group was split into two sub-groups; no further operations permitted.
     Split = 3,
+    /// Group ran its configured `max_cycles`; contributions are rejected.
+    Completed = 4,
 }
 
 #[contracttype]
@@ -1161,36 +1201,87 @@ pub struct GroupAnalytics {
     pub fee_bps: u32,
 }
 
-// ── Member Payout History (#1028) ─────────────────────────────────────────────
-
-/// One payout transfer a member received, returned by
-/// `get_member_payout_history`.
+/// Overflow key enum — DataKey5 is capped at 50 variants by the soroban XDR limit.
+#[derive(Clone)]
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemberPayoutEntry {
-    /// Cycle (0-based) the paid round belongs to.
-    pub cycle: u32,
-    /// Round (0-based, counted across cycles) that was paid out.
-    pub round: u32,
-    pub amount: i128,
-    pub token: Address,
-    /// Ledger sequence at which the payout was made.
-    pub ledger: u32,
+pub enum DataKey6 {
+    // ── Cross-Group Member Obligations ────────────────────────────────────────
+    /// Vec<Address> — other ROSCA group contracts `member` has linked to their
+    /// obligation index (persistent). This contract is always included
+    /// implicitly while the member is active here.
+    MemberGroupIndex(Address),
+
+    // ── Round Deadline Extension ──────────────────────────────────────────────
+    /// u64 — maximum `extra_seconds` an `ExtendRound` proposal may request.
+    /// 0 (default) disables member-voted extensions.
+    MaxRoundExtensionSeconds,
+    /// u32 — cycle in which the last `ExtendRound` proposal was applied.
+    LastExtendedCycle,
+
+    // ── Late-Fee Waiver ───────────────────────────────────────────────────────
+    /// CollectedPenaltyRecord — penalty collected from (member, round) (persistent).
+    CollectedPenalty(Address, u32),
+
+    // ── Group Metadata ────────────────────────────────────────────────────────
+    /// GroupMetadata — display name, category and description hash.
+    GroupMetadata,
 }
 
-// ── Hardship Contribution Reduction (#1030) ───────────────────────────────────
+// ── Cross-Group Member Obligations ────────────────────────────────────────────
 
-/// A member's request to contribute `reduced_amount` instead of their full
-/// contribution for one `round`, with `shortfall` drawn from the emergency
-/// reserve once the `HardshipReduction` proposal is approved.
+/// Outstanding contribution a member owes to one group for its current round.
+/// `group_id` is the group's contract address (one group per contract).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HardshipRequest {
-    pub proposal_id: u32,
+pub struct MemberObligation {
+    pub group_id: Address,
+    pub token: Address,
+    pub amount_due: i128,
+    pub deadline: u64,
+}
+
+// ── Late-Fee Waiver ───────────────────────────────────────────────────────────
+
+/// Penalty collected from a member for a round, kept so it can be refunded by
+/// an approved `WaivePenalty` proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectedPenaltyRecord {
     pub member: Address,
     pub round: u32,
-    pub cycle: u32,
-    pub reduced_amount: i128,
-    pub shortfall: i128,
-    pub approved: bool,
+    /// Token the penalty was paid in (the group's base token).
+    pub token: Address,
+    /// Total collected for this (member, round).
+    pub amount: i128,
+    /// Net reputation change applied when the penalty was collected.
+    pub reputation_delta: i128,
+    /// Number of times the penalty was applied (each one added a default).
+    pub applications: u32,
+    pub refunded: bool,
+}
+
+// ── Group Metadata ────────────────────────────────────────────────────────────
+
+/// Human-readable group metadata, editable by the admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupMetadata {
+    pub name: String,
+    pub category: Symbol,
+    pub description_hash: BytesN<32>,
+    pub updated_at_ledger: u32,
+}
+
+/// Public directory listing for this group.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupDirectoryEntry {
+    pub group_id: Address,
+    pub metadata: Option<GroupMetadata>,
+    pub status: GroupStatus,
+    pub token: Address,
+    pub contribution_amount: i128,
+    pub member_count: u32,
+    pub max_members: u32,
+    pub current_round: u32,
 }

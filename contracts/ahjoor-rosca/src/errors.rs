@@ -284,13 +284,30 @@ pub enum ExtError3 {
     NoVestingRecord = 155,
     /// Nothing has vested since the last claim.
     NothingVested = 156,
-    // ── Hardship Contribution Reduction (#1030) ──────────────────────────────
-    /// reduced_amount must be positive and below the member's full contribution.
-    InvalidHardshipAmount = 157,
-    /// The round has already been paid out or closed.
-    HardshipRoundPassed = 158,
-    /// The member already has a pending or approved hardship request this cycle.
-    HardshipAlreadyUsedThisCycle = 159,
-    /// The emergency reserve cannot cover the requested shortfall.
-    InsufficientReserveForHardship = 160,
+    // ── Cross-Group Member Obligations ────────────────────────────────────────
+    /// A group cannot be linked to its own obligation index.
+    InvalidLinkedGroup = 157,
+    /// The member is not an active member of the group being linked.
+    NotActiveInLinkedGroup = 158,
+    /// The member's obligation index is full.
+    LinkedGroupLimitReached = 159,
+    // ── Round Deadline Extension ──────────────────────────────────────────────
+    /// Member-voted round extensions are disabled (max extension is 0).
+    RoundExtensionDisabled = 160,
+    /// `extra_seconds` must be positive and within the group maximum.
+    InvalidRoundExtension = 161,
+    /// The current round's deadline has already passed.
+    RoundDeadlineAlreadyPassed = 162,
+    /// An extension has already been approved in the current cycle.
+    RoundAlreadyExtended = 163,
+    // ── Late-Fee Waiver ───────────────────────────────────────────────────────
+    /// No pending or collected (unrefunded) penalty exists for the member and round.
+    PenaltyNotFound = 164,
+    /// The penalty pool does not hold enough free balance to refund the penalty.
+    PenaltyRefundUnavailable = 165,
+    // ── Group Metadata ────────────────────────────────────────────────────────
+    /// Group name exceeds `MAX_GROUP_NAME_LEN` bytes.
+    GroupNameTooLong = 166,
+    /// Group name must not be empty.
+    EmptyGroupName = 167,
 }
